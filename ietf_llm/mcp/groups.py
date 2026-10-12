@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 from ..embeddings.search import index_model
 from ..embeddings.search import search as _search
+from ..log import LogLevel, log
 from ..singletons import groups as mirror
 from ..singletons.catalog import render_efforts
 from .common import _offload
@@ -95,14 +96,20 @@ def semantic_ranking(
         if lab
     ]
     slug = _STATE_SLUGS.get((state or "").lower())
-    hits = _search(
-        mirror.GROUPS_CORPUS,
-        query,
-        k=_RETRIEVE_CHUNKS,
-        label=labels[0] if labels else None,
-        state=slug,
-        diversify=False,
-    )
+    try:
+        hits = _search(
+            mirror.GROUPS_CORPUS,
+            query,
+            k=_RETRIEVE_CHUNKS,
+            label=labels[0] if labels else None,
+            state=slug,
+            diversify=False,
+        )
+    except Exception as err:  # pylint: disable=broad-except
+        # An unreachable embedding backend must not take `find_efforts` down
+        # with it: the keyword ranking still answers.
+        log(f"Group charter search unavailable: {err}", level=LogLevel.WARN)
+        return {}
     scores: Dict[str, float] = {}
     for hit in hits:
         acronym = hit.file.rsplit("/", 1)[-1].removesuffix(".md")

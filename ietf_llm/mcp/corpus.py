@@ -96,7 +96,13 @@ def _available_to_seed(local: List[str]) -> str:
     if index is None:
         return ""
     known = set(local)
-    names = sorted(e.name for e in index.corpora if e.name not in known)
+    # Underscore-prefixed members (the chartered-group mirror) are machinery
+    # that installs itself, not corpora to gather.
+    names = sorted(
+        e.name
+        for e in index.corpora
+        if e.name not in known and not e.name.startswith("_")
+    )
     if not names:
         return ""
     return (

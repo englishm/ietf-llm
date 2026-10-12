@@ -454,3 +454,133 @@ def test_row_summary_replaces_a_stub_description(mirror: _Datatracker) -> None: 
 def test_mirror_is_stamped_fresh(mirror: _Datatracker) -> None:  # noqa: ARG001
     path = Path(reader.groups_files_dir()) / reader.GROUPS_FILE
     assert time.time() - path.stat().st_mtime < 60
+
+
+# --- seed store --------------------------------------------------------------
+
+
+def _publish(tmp_path: Path) -> str:
+    from ietf_llm.seed import publish  # pylint: disable=import-outside-toplevel
+
+    base = str(tmp_path / "store")
+    publish.publish_store(
+        publish.generation_dir(base),
+        add=[reader.GROUPS_CORPUS],
+        no_gather=True,
+        gather=lambda c, m: None,
+    )
+    return base
+
+
+def test_published_bundle_carries_text_state_and_index(indexed: _Datatracker, tmp_path: Path) -> None:  # noqa: ARG001
+    import tarfile  # pylint: disable=import-outside-toplevel
+
+    from ietf_llm.seed import publish  # pylint: disable=import-outside-toplevel
+
+    base = _publish(tmp_path)
+    bundles = list(Path(publish.generation_dir(base)).glob("_groups/*.tar.gz"))
+    assert len(bundles) == 1
+    with tarfile.open(bundles[0]) as tar:
+        names = set(tar.getnames())
+    assert {"files/groups.json", "files/charters/httpbis.md", "files/state/watermarks.json",
+            "embeddings.db"} <= names
+
+
+def test_fresh_machine_installs_the_seed_then_only_asks_for_the_delta(
+    indexed: _Datatracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil  # pylint: disable=import-outside-toplevel
+
+    base = _publish(tmp_path)
+    shutil.rmtree(Path(get_cache_dir()) / reader.GROUPS_CORPUS)
+    assert reader.load_groups() is None
+    monkeypatch.setenv("IETF_LLM_SEED_URL", base)
+
+    fresh = _Datatracker()
+    writer.ensure_groups_index(
+        Verbosity.QUIET, fetch=fresh, charter_fetch=_charter_fetch, embed=False, force=True
+    )
+    assert reader.get_group("httpbis") is not None
+    assert reader.charter_text("httpbis")
+    milestone_urls = fresh.feed_urls("groupmilestone/?")
+    assert milestone_urls and all("time__gte=" in u for u in milestone_urls)
+
+
+def test_no_seed_means_a_cold_build(
+    indexed: _Datatracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil  # pylint: disable=import-outside-toplevel
+
+    base = _publish(tmp_path)
+    shutil.rmtree(Path(get_cache_dir()) / reader.GROUPS_CORPUS)
+    monkeypatch.setenv("IETF_LLM_SEED_URL", base)
+    fresh = _Datatracker()
+    writer.ensure_groups_index(
+        Verbosity.QUIET, fetch=fresh, charter_fetch=_charter_fetch, embed=False, force=True,
+        seed=False,
+    )
+    assert all("time__gte=" not in u for u in fresh.feed_urls("groupmilestone/?"))
+
+
+def test_an_existing_mirror_is_never_replaced_by_the_seed(
+    indexed: _Datatracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _publish(tmp_path)
+    monkeypatch.setenv("IETF_LLM_SEED_URL", base)
+    called: List[bool] = []
+    monkeypatch.setattr(writer, "install_seed", lambda v: called.append(True) or True)
+    _refresh(indexed, force=False)
+    assert called == []
+
+
+def test_seed_members_are_not_offered_as_corpora_to_gather(
+    indexed: _Datatracker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch  # noqa: ARG001
+) -> None:
+    from ietf_llm.mcp import corpus as corpus_tools  # pylint: disable=import-outside-toplevel
+    from ietf_llm.seed import catalog as seed_catalog  # pylint: disable=import-outside-toplevel
+    from ietf_llm.seed import fetch as seed_fetch  # pylint: disable=import-outside-toplevel
+    from ietf_llm.seed import generation  # pylint: disable=import-outside-toplevel
+
+    base = _publish(tmp_path)
+    monkeypatch.setenv("IETF_LLM_SEED_URL", base)
+    index = seed_fetch.load_index(generation.store_url() or "")
+    assert index is not None and index.entry("_groups") is not None
+    seed_catalog.cache_index(index)
+    monkeypatch.setattr(seed_catalog, "refresh_mirror", lambda: None)
+    monkeypatch.setattr(corpus_tools, "gather_enabled", lambda: True)
+    assert "_groups" not in corpus_tools._available_to_seed([])  # pylint: disable=protected-access
+
+
+def test_cloud_backend_skips_the_refresh(isolated_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ARG001
+    monkeypatch.setenv("IETF_LLM_STORE_BACKEND", "cloud")
+    dt = _Datatracker()
+    _refresh(dt)
+    assert dt.urls == [] and reader.load_groups() is None
+
+
+def test_embed_settings_resolve_like_a_gather(isolated_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ARG001
+    from ietf_llm.gather.sequencer import embed_settings  # pylint: disable=import-outside-toplevel
+
+    assert embed_settings() == (None, True)
+    monkeypatch.setenv("IETF_LLM_EMBED_MODEL", "some/model")
+    monkeypatch.setenv("IETF_LLM_NO_EMBED", "1")
+    assert embed_settings() == ("some/model", False)
+
+
+def test_the_tools_are_registered() -> None:
+    import asyncio  # pylint: disable=import-outside-toplevel
+
+    from mcp.server.fastmcp import FastMCP  # pylint: disable=import-outside-toplevel
+
+    server = FastMCP("t")
+    tools.register(server)
+    names = {t.name for t in asyncio.run(server.list_tools())}
+    assert {"get_group_info", "search_groups", "list_milestones", "group_timeline"} <= names
+
+
+def test_embedded_milestone_text_does_not_depend_on_todays_date(mirror: _Datatracker) -> None:
+    mirror.extra_milestones = [_milestone(16, 1, "Long past", "2001-01-01")]
+    _refresh(mirror)
+    text = Path(reader.charter_file("httpbis")).read_text()
+    assert "Long past" in text and "overdue" not in text
+    assert "overdue" in reader.render_group("httpbis")

@@ -15,7 +15,7 @@ of effort records — synthesised from the Datatracker group collection by
 This module is read-only and never touches the network — same boundary
 as the rest of the MCP server. It answers the topic-first question
 ("what is the IETF doing around X?") that the corpus-first tools can't:
-rank active efforts by a free-text topic and tag each with whether it is
+rank efforts by a free-text topic and tag each with whether it is
 already gathered here, so the model prefers an already-cached corpus
 over a fresh gather. We render markdown rather than JSON to match every
 other ietf-llm tool and to keep result lists token-cheap.

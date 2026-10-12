@@ -216,11 +216,12 @@ def _parse_date(value: Any) -> Optional[date]:
         return None
 
 
-def milestone_line(milestone: Dict[str, Any]) -> str:
+def milestone_line(milestone: Dict[str, Any], today: Optional[date] = None) -> str:
     due = str(milestone.get("due") or "")[:7] or "no date"
     docs = milestone.get("docs") or []
     suffix = f" ({', '.join(docs)})" if docs else ""
-    return f"[{due}] {milestone.get('desc', '').strip()}{suffix} — {milestone_status(milestone)}"
+    desc = str(milestone.get("desc", "")).strip()
+    return f"[{due}] {desc}{suffix} — {milestone_status(milestone, today)}"
 
 
 def render_milestones(

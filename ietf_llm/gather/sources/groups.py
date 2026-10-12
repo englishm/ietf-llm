@@ -23,11 +23,14 @@ import json
 import os
 import re
 import time
+from datetime import date
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
 from ...atomicio import write_if_changed
+from ...config import service as service_config
+from ...freshness import record_gather
 from ...log import LogLevel, Verbosity, log
 from ...net import (
     DEFAULT_HEADERS,
@@ -434,7 +437,9 @@ def render_charter_file(
     live = [m for m in milestones if m.get("state") != "deleted"]
     if live:
         lines += ["", reader.MILESTONES_HEADING, ""]
-        lines += [f"- {reader.milestone_line(m)}" for m in live]
+        # Dated against the epoch so the embedded text does not change merely
+        # because a milestone slipped into the past.
+        lines += [f"- {reader.milestone_line(m, date.min)}" for m in live]
     return "\n".join(lines) + "\n"
 
 
@@ -471,9 +476,25 @@ def ensure_groups_index(
     embed_model: Optional[str] = None,
     embed: bool = True,
     batch: int = CHARTER_BATCH,
+    seed: bool = True,
 ) -> None:
-    """Refresh the chartered-group mirror, then its charter index. Never raises."""
+    """Refresh the chartered-group mirror, then its charter index. Never raises.
+
+    On a machine with no mirror yet this first installs the seed store's
+    snapshot, so the refresh below is the incremental delta rather than a
+    cold build of every feed and charter.
+
+    Not run on the cloud backend: its hosts are ephemeral, so a mirror built
+    there would be rebuilt (and the upstreams re-hit) on every gather until the
+    mirror has a durable home in the fleet store.
+    """
+    if service_config.store_backend() == "cloud":
+        return
     try:
+        if seed and not os.path.exists(
+            os.path.join(reader.groups_files_dir(), reader.GROUPS_FILE)
+        ):
+            install_seed(verbosity)
         _ensure(
             verbosity,
             force,
@@ -534,7 +555,46 @@ def _ensure(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     _write_json(fetched_path, fetched, verbosity)
     if refreshed:
         _mirror.touch(groups_path)
+        record_gather(reader.GROUPS_CORPUS)
     _index(verbosity, embed_model, embed)
+
+
+def install_seed(verbosity: Verbosity = Verbosity.STATUS) -> bool:
+    """Install the seed store's `_groups` snapshot. Best-effort; returns
+    whether one was installed.
+
+    Only ever a cold start: once a mirror exists it refreshes itself
+    incrementally, which is cheaper than another download. The snapshot is
+    taken whole, state files and embedding index included; if its embedding
+    model is not this machine's the index builder re-embeds, which for a few
+    thousand short chunks is the cost of using a different model, not a failure.
+    """
+    if not service_config.seeding_enabled():
+        return False
+    # Lazy: the seed consumer is gather-path only, and this keeps it off any
+    # path that merely reads.
+    # pylint: disable=import-outside-toplevel
+    from ...seed import fetch as seed_fetch
+    from ...seed import format as seed_fmt
+    from ...seed import generation as seed_generation
+
+    # pylint: enable=import-outside-toplevel
+    seed_url = seed_generation.store_url()
+    if not seed_url:
+        return False
+    index = seed_fetch.load_index(seed_url)
+    entry = index.entry(reader.GROUPS_CORPUS) if index else None
+    if entry is None:
+        return False
+    try:
+        seed_fetch.install(seed_url, entry)
+    except (seed_fetch.SeedFetchError, seed_fmt.SeedFormatError) as err:
+        log(f"Groups: seed failed ({err})", verbosity, LogLevel.PROGRESS)
+        return False
+    log(
+        f"Groups: seeded from {seed_url} ({entry.gathered})", verbosity, LogLevel.STATUS
+    )
+    return True
 
 
 def _touch(path: str) -> None:

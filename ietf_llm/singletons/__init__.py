@@ -6,12 +6,16 @@ each mirrored to a leading-underscore dir under the cache root (kept out of
 
   catalog.py  — the active-effort catalog (`_catalog/`), behind `find_efforts`
   rfcs.py     — the RFC-series index (`_rfc/`), behind `search_rfc_index` / `get_rfc_info`
+  groups.py   — every chartered WG / RG with charters, milestones and timeline
+                (`_groups/`), behind `get_group_info` / `list_milestones` /
+                `group_timeline`; also the wider candidate set for `find_efforts`
 
 Each is the read side of a `gather/sources/` writer twin (`sources/catalog.py`,
 `sources/rfcs.py`) and owns the on-disk location its writer mirrors into — so
 the writers import the path constants (`catalog_index_dir` / `rfc_index_dir`,
-`CATALOG_FILE` / `RFC_FILES`) from here. The two readers share no code and are
-independent peers, so they stay separate submodules with nothing re-exported at
-the package level; import them as `singletons.catalog` / `singletons.rfcs`. See
+`CATALOG_FILE` / `RFC_FILES`) from here. The readers are independent peers (the
+catalog reads the group mirror for its wider candidate set, nothing else crosses),
+so they stay separate submodules with nothing re-exported at the package level;
+import them as `singletons.catalog` / `singletons.rfcs` / `singletons.groups`. See
 `docs/architecture.md`, "Cross-corpus singletons".
 """

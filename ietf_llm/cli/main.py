@@ -17,11 +17,10 @@ from __future__ import annotations
 import argparse
 import copy
 import sys
-from typing import Optional, Tuple
+from typing import Optional
 
-from .. import config
 from ..gather.cli import build_parser
-from ..gather.sequencer import GLOBAL_SCALARS, _gather_one, _persist_seed_toggle
+from ..gather.sequencer import _gather_one, _persist_seed_toggle, embed_settings
 from ..gather.sources.catalog import ensure_catalog_index
 from ..gather.sources.groups import ensure_groups_index
 from ..gather.sources.repo_discovery import print_discovery
@@ -51,6 +50,7 @@ def _init_report(rfc_corpus_reason: Optional[str] = None) -> None:
     # pylint: disable=import-outside-toplevel
     from ..gather.sources.rfc_corpus import local_build
     from ..singletons import catalog as catalog_reader
+    from ..singletons import groups as group_reader
     from ..singletons.rfcs import _load as load_rfcs
 
     # pylint: enable=import-outside-toplevel
@@ -77,15 +77,12 @@ def _init_report(rfc_corpus_reason: Optional[str] = None) -> None:
         if efforts
         else "Efforts:       catalog not available"
     )
-
-
-def _embed_settings(args: argparse.Namespace) -> Tuple[Optional[str], bool]:
-    """The embedding model and whether to embed, resolved the way a gather
-    resolves them (env > CLI > global config > default), for housekeeping
-    that builds an index outside any one gather."""
-    resolved = copy.copy(args)
-    config.merge_global(resolved, GLOBAL_SCALARS)
-    return resolved.embed_model, not resolved.no_embed
+    chartered = group_reader.load_groups()
+    if chartered:
+        held = sum(1 for g in chartered if group_reader.charter_text(g["acronym"]))
+        print(f"Groups:        {len(chartered):,} chartered, {held:,} charters held")
+    else:
+        print("Groups:        chartered-group mirror not available")
 
 
 def _housekeeping(
@@ -168,7 +165,7 @@ def main() -> None:  # pylint: disable=too-many-branches,too-many-statements
         # to report — seeding turned off — is a gather, which is exactly what
         # the user of this flag does not have a corpus for.
         _persist_seed_toggle(args)
-        model, embed = _embed_settings(args)
+        model, embed = embed_settings(args)
         reason = _housekeeping(verbosity, forced=True, embed_model=model, embed=embed)
         if verbosity is not Verbosity.QUIET:
             _init_report(reason)
@@ -221,7 +218,7 @@ def main() -> None:  # pylint: disable=too-many-branches,too-many-statements
     else:
         _gather_one(args, verbosity)
 
-    model, embed = _embed_settings(args)
+    model, embed = embed_settings(args)
     _housekeeping(verbosity, embed_model=model, embed=embed)
 
 
