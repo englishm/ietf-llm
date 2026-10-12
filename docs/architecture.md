@@ -172,6 +172,13 @@ park the hot index on tmpfs while the corpus comes from elsewhere.
 │   ├── catalog.json                       #   derived slim effort records (find_efforts reads)
 │   ├── raw-active.json / raw-bof.json     #   raw Datatracker group slices (revalidation)
 │   └── *.etag                             #   per-file ETag sidecars (conditional GET)
+├── _groups/                                # cross-corpus chartered-group mirror (singleton), laid out like a corpus
+│   ├── files/groups.json                  #   every WG / RG, active or concluded (find_efforts, search_groups)
+│   ├── files/milestones.json              #   {acronym: [milestone]} (list_milestones)
+│   ├── files/timeline.json                #   {acronym: [event]} (group_timeline)
+│   ├── files/charters/<acronym>.md        #   charter + current milestones — the embedded text
+│   ├── files/state/                       #   writer bookkeeping: watermarks, raw feed rows (ships in the seed)
+│   └── last-gathered                      #   ISO-8601 sentinel; the index lives at <index dir>/_groups/embeddings.db
 ├── .http-cache.json                       # shared ETag store (conditional GET)
 └── _github-users.json                     # shared login → name / company cache
 ```
@@ -358,6 +365,8 @@ Key invariants:
   leading underscore keeps it out of
   `list_corpora` / `ietf-llm --list`, which enumerate real corpora. The
   `search_rfc_index` / `get_rfc_info` tools read it; it is not embedded.
+- **`_groups/` is the superset of the catalog** — every chartered group with its
+  charter, milestones and timeline (see "The chartered-group mirror").
 - **`_catalog/` is the matching singleton for active efforts.** It
   mirrors the active (and BoF) slice of the Datatracker group list,
   refreshed beside `_rfc/` in tail housekeeping with the same TTL / ETag
@@ -499,7 +508,8 @@ ietf_llm/
 ├── singletons/             # cross-corpus singleton readers (fleet-wide indexes, offline read side;
 │   │                       # each the read twin of a gather/sources/ writer that mirrors into it)
 │   ├── rfcs.py             # RFC-series reader (search_rfc_index / get_rfc_info); reads _rfc/ (mirrored from rfc.fyi)
-│   └── catalog.py          # active-effort reader (find_efforts); ranks _catalog/ by topic, tags cached
+│   ├── catalog.py          # effort reader (find_efforts); ranks groups by keyword + charter, tags cached
+│   └── groups.py           # chartered-group reader (get_group_info, list_milestones, group_timeline); reads _groups/
 ├── serve_metrics.py        # serve-side RED registry + Prometheus /metrics exposition (read side)
 ├── data/mcp-instructions.md              # the routing brain, served as the MCP `instructions` field
 ├── data/skills/ietf-interpreting/  # read-side norms (vendored), via read_ietf_interpretation_norms
@@ -538,6 +548,7 @@ ietf_llm/
 │       ├── _mirror.py              # shared singleton-mirror plumbing (TTL / conditional GET / sidecars)
 │       ├── rfcs.py                 # ensure_rfc_index: mirror the rfc.fyi RFC-series JSON → _rfc/
 │       ├── catalog.py              # ensure_catalog_index: mirror the Datatracker group list → _catalog/
+│       ├── groups.py               # ensure_groups_index: every WG/RG + charters + milestones + timeline → _groups/; embeds the charters
 │       ├── datatracker_history.py  # governance / doc-lifecycle timeline events
 │       ├── datatracker_github.py   # github_username profile resources → person (by email)
 │       ├── datatracker_people.py   # mail address → person id (mail-side identity spine)
@@ -588,9 +599,23 @@ which tool for which question, with worked examples — lives in
   two on-demand norms tools `read_ietf_interpretation_norms` /
   `read_ietf_participation_norms` (served on demand so the always-on
   `instructions` field stays focused on routing).
-- **Discover (topic-first):** `find_efforts(query)` ranks active IETF/IRTF
-  efforts by topic and tags the already-gathered ones — the entry point when no
-  corpus is named. Reads the `_catalog/` singleton, not a corpus.
+- **Discover (topic-first):** `find_efforts(query)` ranks IETF/IRTF efforts by
+  topic and tags the already-gathered ones — the entry point when no corpus is
+  named. It reads the `_groups/` mirror (falling back to the active-only
+  `_catalog/` where that is absent) and fuses two rankings by rank, not score:
+  the keyword match over acronym, name and description, and a semantic search of
+  the charters. Concluded groups are included, labelled, and weighted below
+  active ones; a query that is exactly one group's acronym pins that group first.
+  A semantic hit must clear an absolute score floor (the charter scores sit in a
+  narrow band, so a spread-based cutoff cannot separate a real topic from noise);
+  it is calibrated to the default embedding model and overridable with
+  `IETF_LLM_GROUPS_MIN_SCORE`. If the embedding backend is down the keyword
+  ranking answers alone.
+- **Chartered groups (cross-corpus):** `get_group_info(acronym)`,
+  `search_groups(query, area, state, kind)`, `list_milestones(...)`,
+  `group_timeline(acronym, year)` — the `_groups/` singleton, not a corpus. They
+  say what a group is *chartered* to do and what it *recorded*, never what it
+  discussed. See "The chartered-group mirror" below.
 - **Catalogue:** `read_digest(kind, …filters)` over
   issues/pulls/threads/people/timeline/index.
 - **Search:** `search_corpus(query, …)` (faceted semantic search in one
@@ -1290,6 +1315,66 @@ the mirror writer (see the networked read exception above). v1 catalog covers
 active groups only;
 concluded efforts surface through `search_rfc_index`, already-cached ones through
 `list_corpora`.
+
+### The chartered-group mirror
+
+`_groups/` is the third singleton and the first that is laid out like a corpus —
+`files/` plus an `embeddings.db` in the index dir, under the name `_groups` — so
+that the ordinary embedding, incremental-skip and seed machinery apply to it
+unchanged. The underscore keeps it out of `list_corpora`, `--list` and the seed
+"available to fast-start" hint. `gather/sources/groups.py` is the only writer;
+`singletons/groups.py` is the offline reader, and the semantic search over the
+charters lives in `mcp/groups.py` beside the embedding code, so the reader stays
+free of it and degrades to keyword matching.
+
+**What is in it.** Every `wg` and `rg` group in any state, with the current
+charter, milestones, and a timeline. The timeline is built from bulk feeds —
+group state changes, charter revisions and IESG approvals, milestone history, and
+RFC publications (joined offline from `_rfc/` by its `wg` field). It does not
+include chair changes (role history references group *history* snapshots, and
+names would need a second fan-out), draft adoption (per document), or meetings.
+Milestone and charter dates before about 2014 reflect the Datatracker import, not
+the original event. Only the **current** charter is held.
+
+**How it stays cheap.** Every feed is fetched in bulk and incrementally: a
+stored watermark per feed (`files/state/watermarks.json`) turns the next request
+into `time__gte=<watermark>`, rows merge by id, and a failed page keeps the
+stored rows and the old watermark. A first full refresh is about 130 requests;
+a daily one is a handful. The one per-group fetch is the charter text (about
+900 groups have a charter document), capped per run (`CHARTER_BATCH`) with active
+groups first, and repeated only when a group's charter revision moves. A fetch
+that fails is not retried for a week. While a backlog remains, batches run at
+most every 15 minutes, so a first run on a machine with no seed trickles in over
+several invocations.
+
+**The embedded document** is `charters/<acronym>.md`: a header (type, state,
+area, a `Source:` citation URL), the charter, and the group's current milestones.
+A group with no charter document carries its Datatracker description instead, so
+it is still searchable. The chunker (`_chunk_charter_file`) stamps each chunk with
+`state`, `area:<acronym>` and `type:<wg|rg>` labels, which is how `search_groups`
+scopes by area, state or kind through the existing facet filters. A
+milestone-only change re-renders the file from the stored charter without
+refetching it, and the embedder's per-file content hash re-embeds just that file.
+
+**Seeding.** The publisher treats `_groups` as an ordinary member of the main
+seed store (its compatibility tuple is the same as any gathered corpus), with
+one difference: it has no gather command, so `seed.publish` refreshes it
+in-process with the same writer and no charter cap. A snapshot therefore carries
+every charter, the state files and the embedding index, and a new machine is
+incremental from its first refresh. A machine only installs the snapshot when it
+has no mirror yet; after that it refreshes itself, which is cheaper than another
+download. A snapshot built with a different embedding model is still installed
+and the index builder re-embeds it.
+
+**Cloud.** Not yet supported: the refresh is skipped on the cloud backend, whose
+hosts are ephemeral, and the mirror has no durable home in the fleet store
+(`fleet/groups/` plus the index plane would be the shape, as for `_catalog/`). The
+tools there report "not gathered yet" and `find_efforts` falls back to the
+active-only `_catalog/`.
+
+**Boundary.** Read tools stay read-only and offline; the mirror is written only
+by the gather path (`ietf-llm <corpus>` tail housekeeping, `--init`, and the seed
+publisher). It is write-side: nothing is visible until a refresh has run.
 
 ### Other normalisation invariants
 

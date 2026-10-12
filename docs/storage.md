@@ -202,7 +202,10 @@ Alongside the control plane, the same bucket holds the **gather accelerator cach
 datatracker conditional-GET/ETag store, the shared GitHub/datatracker identity maps, and the
 `find_efforts` effort catalog. The cloud backend round-trips them through the store (hydrated into
 scratch before a gather, persisted after), so a scale-to-zero host revalidates (304) rather than
-re-fetching from rate-limited upstreams (datatracker, GitHub REST) once its scratch is wiped. It is
+re-fetching from rate-limited upstreams (datatracker, GitHub REST) once its scratch is wiped.
+The chartered-group mirror (`_groups/`, behind `get_group_info` / `search_groups`) is *not* synced yet:
+its refresh is skipped on the cloud backend, those tools report "not gathered yet" there, and
+`find_efforts` falls back to the active-only catalog. It is
 automatic and best-effort — a sync failure just means a cold rebuild, never a failed gather — and
 there is nothing to configure. For the per-cache cloud keys, their write-conflict policies (RMW /
 CAS-merge / last-writer-wins), and which caches stay ephemeral, see
