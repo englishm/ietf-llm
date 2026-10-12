@@ -330,7 +330,8 @@ def test_batch_stops_after_consecutive_transient_failures() -> None:
 
     fetched: Dict[str, Dict[str, Any]] = {}
     texts = writer._fetch_charter_batch(_fake_groups(12), fetched, down, 100, Verbosity.QUIET)  # pylint: disable=protected-access
-    assert len(calls) == 5 and texts == {} and fetched == {}
+    assert len(calls) == 5 and texts == {}
+    assert all(v["tries"] == 1 and not v["ok"] for v in fetched.values()) and len(fetched) == 5
 
 
 def test_a_success_resets_the_failure_streak() -> None:
@@ -341,7 +342,8 @@ def test_a_success_resets_the_failure_streak() -> None:
 
     fetched: Dict[str, Dict[str, Any]] = {}
     texts = writer._fetch_charter_batch(_fake_groups(10), fetched, flaky, 100, Verbosity.QUIET)  # pylint: disable=protected-access
-    assert len(texts) == 2 and len(fetched) == 2
+    assert len(texts) == 2 and sum(v["ok"] for v in fetched.values()) == 2
+    assert len(fetched) == 10  # the failures are counted, not forgotten
 
 
 def test_absent_revisions_do_not_end_a_batch() -> None:
@@ -376,6 +378,8 @@ def test_charter_fetch_distinguishes_absent_from_failed(monkeypatch: pytest.Monk
 
     assert _fetch_with(monkeypatch, _Response(200, "the charter")) == "the charter"
     assert _fetch_with(monkeypatch, _Response(404, "<html>")) == ""
+    assert _fetch_with(monkeypatch, _Response(410, "gone")) == ""
+    assert _fetch_with(monkeypatch, _Response(403, "blocked")) is None
     assert _fetch_with(monkeypatch, _Response(503, "busy")) is None
     assert _fetch_with(monkeypatch, _Response(429, "slow down")) is None
     assert _fetch_with(monkeypatch, _Response(200, "")) is None
@@ -835,3 +839,58 @@ def test_stale_index_is_rebuilt_after_a_failure_that_left_it_behind(
 def test_nothing_pending_means_no_model_load(indexed: _Datatracker, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(writer, "_index", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
     _refresh(indexed, embed=True, embed_model="stub", force=False)
+
+
+# --- starvation protection --------------------------------------------------
+
+
+def test_a_charter_that_always_fails_cannot_hold_the_queue() -> None:
+    groups = _fake_groups(7)
+    poison = {f"charter-ietf-g{i:02d}" for i in range(5)}
+
+    def fetch(doc: str, rev: str) -> Optional[str]:  # noqa: ARG001
+        return None if doc in poison else "text"
+
+    fetched: Dict[str, Dict[str, Any]] = {}
+    for _ in range(writer._MAX_TRIES):  # pylint: disable=protected-access
+        got = writer._fetch_charter_batch(groups, fetched, fetch, 100, Verbosity.QUIET)  # pylint: disable=protected-access
+        assert got == {}  # each batch ends on the same five
+    got = writer._fetch_charter_batch(groups, fetched, fetch, 100, Verbosity.QUIET)  # pylint: disable=protected-access
+    assert set(got) == {"g05", "g06"}
+
+
+def test_a_set_aside_charter_is_tried_again_after_the_lockout() -> None:
+    groups = _fake_groups(1)
+    now = time.time()
+    tries = writer._MAX_TRIES  # pylint: disable=protected-access
+    fetched = {"g00": {"rev": "01", "ok": False, "at": now, "tries": tries}}
+    assert writer._pending_charters(groups, fetched, now) == []  # pylint: disable=protected-access
+    later = now + writer._TRANSIENT_LOCKOUT + 1  # pylint: disable=protected-access
+    assert writer._pending_charters(groups, fetched, later) == groups  # pylint: disable=protected-access
+
+
+def test_fewer_than_the_limit_failures_stay_pending() -> None:
+    groups = _fake_groups(1)
+    fetched = {"g00": {"rev": "01", "ok": False, "at": time.time(), "tries": 2}}
+    assert writer._pending_charters(groups, fetched, time.time()) == groups  # pylint: disable=protected-access
+
+
+def test_attempt_count_restarts_for_a_new_revision() -> None:
+    groups = _fake_groups(1)
+    fetched = {"g00": {"rev": "00", "ok": False, "at": time.time(), "tries": 4}}
+    writer._fetch_charter_batch(groups, fetched, lambda d, r: None, 100, Verbosity.QUIET)  # pylint: disable=protected-access
+    assert fetched["g00"]["tries"] == 1 and fetched["g00"]["rev"] == "01"
+
+
+def test_records_from_before_attempts_were_counted_keep_the_old_window() -> None:
+    groups = _fake_groups(1)
+    now = time.time()
+    legacy = {"g00": {"rev": "01", "ok": False, "at": now}}
+    assert writer._pending_charters(groups, legacy, now) == []  # pylint: disable=protected-access
+    assert writer._pending_charters(groups, legacy, now + writer._RETRY_AFTER + 1) == groups  # pylint: disable=protected-access
+
+
+def test_absent_revision_is_recorded_as_absent() -> None:
+    fetched: Dict[str, Dict[str, Any]] = {}
+    writer._fetch_charter_batch(_fake_groups(1), fetched, lambda d, r: "", 100, Verbosity.QUIET)  # pylint: disable=protected-access
+    assert fetched["g00"]["absent"] is True and fetched["g00"]["ok"] is False

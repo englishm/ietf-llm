@@ -60,6 +60,14 @@ _FAILURE_BACKOFF = 60 * 60
 #: A charter the server says does not exist is not asked for again for this long.
 _RETRY_AFTER = 7 * 24 * 60 * 60
 
+#: Responses that mean the revision is not coming back.
+_ABSENT_STATUSES = frozenset({404, 410})
+
+#: A charter that fails transiently this many times is set aside for a day, so
+#: one that fails every time cannot hold the front of the queue indefinitely.
+_MAX_TRIES = 5
+_TRANSIENT_LOCKOUT = 24 * 60 * 60
+
 #: A batch stops after this many transient failures in a row. They mean the
 #: network or the server is unwell, and carrying on would only add load.
 _MAX_CONSECUTIVE_FAILURES = 5
@@ -484,8 +492,8 @@ def _fetch_charter(doc: str, rev: str) -> Optional[str]:
     """The text of one charter revision.
 
     Three outcomes, because the caller treats them differently: the text; `""`
-    when the server says the revision does not exist, which is permanent and
-    worth remembering; and None for anything else (network error, throttling,
+    when the server says the revision does not exist (404, or 410 Gone), which
+    is permanent and worth remembering; and None for anything else (network error, throttling,
     a server error, an empty body), which is transient and must not be.
     """
     url = f"https://www.ietf.org/charter/{doc}-{rev}.txt"
@@ -498,8 +506,8 @@ def _fetch_charter(doc: str, rev: str) -> Optional[str]:
         )
         return None
     size = len(response.content)
-    if response.status_code == 404:
-        http_metrics.record(url, 404, size, error=True)
+    if response.status_code in _ABSENT_STATUSES:
+        http_metrics.record(url, response.status_code, size, error=True)
         return ""
     if not response.ok or not response.text:
         http_metrics.record(url, response.status_code, size, error=True)
@@ -507,6 +515,24 @@ def _fetch_charter(doc: str, rev: str) -> Optional[str]:
         return None
     http_metrics.record(url, response.status_code, size)
     return response.text
+
+
+def _is_pending(have: Dict[str, Any], now: float) -> bool:
+    """Whether a recorded attempt at a charter revision still leaves it owed.
+
+    A fetched charter is done. One the server said is absent waits out
+    `_RETRY_AFTER`, as does a record from before attempts were counted. One
+    that failed transiently stays owed until it has failed `_MAX_TRIES` times,
+    then waits out `_TRANSIENT_LOCKOUT`.
+    """
+    if have.get("ok"):
+        return False
+    age = now - have.get("at", 0)
+    if have.get("absent") or "tries" not in have:
+        return age >= _RETRY_AFTER
+    if have["tries"] >= _MAX_TRIES:
+        return age >= _TRANSIENT_LOCKOUT
+    return True
 
 
 def _pending_charters(
@@ -518,9 +544,8 @@ def _pending_charters(
         if not group.get("charter_doc") or not group.get("charter_rev"):
             continue
         have = fetched.get(group["acronym"], {})
-        if have.get("rev") == group["charter_rev"]:
-            if have.get("ok") or now - have.get("at", 0) < _RETRY_AFTER:
-                continue
+        if have.get("rev") == group["charter_rev"] and not _is_pending(have, now):
+            continue
         pending.append(group)
     pending.sort(key=lambda g: (reader.is_closed(g), g["acronym"]))
     return pending
@@ -743,33 +768,35 @@ def _fetch_charter_batch(
     records the outcome of each in `fetched`; the caller persists both, files
     first, so a record never claims text that was not written.
 
-    Only a definite answer is recorded: the text, or "no such revision". A
-    transient failure leaves the charter pending for the next batch, and
-    several in a row end this batch. Recording them would block the charter
-    for the retry window over a network blip.
+    A definite answer (the text, or "no such revision") is recorded as such. A
+    transient failure is only counted against the charter, which stays pending
+    until it has failed `_MAX_TRIES` times, and several in a row end this
+    batch. Recording them as final would block a charter for the retry window
+    over a network blip, and not counting them would let one that always
+    fails sit at the front of the queue forever.
     """
     now = time.time()
     pending = _pending_charters(groups, fetched, now)[: max(0, batch)]
     texts: Dict[str, str] = {}
-    attempted = missing = transient = streak = 0
+    missing = transient = streak = 0
     for group in pending:
-        text = charter_fetch(group["charter_doc"], group["charter_rev"])
-        attempted += 1
+        acronym, rev = group["acronym"], group["charter_rev"]
+        text = charter_fetch(group["charter_doc"], rev)
         if text is None:
             transient += 1
             streak += 1
+            have = fetched.get(acronym, {})
+            tries = have.get("tries", 0) if have.get("rev") == rev else 0
+            fetched[acronym] = {"rev": rev, "ok": False, "at": now, "tries": tries + 1}
             if streak >= _MAX_CONSECUTIVE_FAILURES:
                 break
             continue
         streak = 0
-        fetched[group["acronym"]] = {
-            "rev": group["charter_rev"],
-            "ok": bool(text),
-            "at": now,
-        }
+        fetched[acronym] = {"rev": rev, "ok": bool(text), "at": now}
         if text:
-            texts[group["acronym"]] = text
+            texts[acronym] = text
         else:
+            fetched[acronym]["absent"] = True
             missing += 1
     if pending:
         log(
