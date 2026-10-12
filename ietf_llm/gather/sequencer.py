@@ -90,6 +90,9 @@ def embed_settings(
     """`(embedding model, whether to embed)` resolved the way a gather does
     (env > CLI > global config > default), for work that builds an index
     outside any one gather. `args` carries the CLI's values, if any."""
+    # A gather resolves `args` in place (and marks it); do not merge twice.
+    if args is not None and getattr(args, "_global_sources", None) is not None:
+        return args.embed_model, not args.no_embed
     resolved = copy.copy(args) if args is not None else argparse.Namespace()
     for name, _env, _default in GLOBAL_SCALARS:
         if not hasattr(resolved, name):

@@ -136,7 +136,7 @@ def tool_search_groups(  # pylint: disable=too-many-arguments,too-many-positiona
 ) -> str:
     groups = mirror.load_groups()
     if groups is None:
-        return mirror.NOT_GATHERED
+        return mirror.not_gathered()
     by_acronym = {g["acronym"]: g for g in groups}
     scores = semantic_ranking(query, state=state, area=area, kind=kind)
     note = ""

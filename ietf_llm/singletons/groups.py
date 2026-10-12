@@ -25,6 +25,7 @@ import re
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..config import service as service_config
 from ..paths import get_cache_dir
 
 #: Cache subdirectory, and the corpus name the charter index is built under.
@@ -68,6 +69,17 @@ NOT_GATHERED = (
 )
 
 _CLEAN_RE = re.compile(r"""[\]().,?:;"'/]""")
+
+
+def not_gathered() -> str:
+    """The not-gathered message, honest about the cloud backend, where the
+    mirror is not refreshed at all."""
+    if service_config.store_backend() == "cloud":
+        return (
+            "The chartered-group mirror is not available on the cloud backend "
+            "yet. `find_efforts` still ranks the active efforts."
+        )
+    return NOT_GATHERED
 
 
 def groups_dir() -> str:
@@ -205,8 +217,16 @@ def milestone_status(milestone: Dict[str, Any], today: Optional[date] = None) ->
     return "open"
 
 
+#: Statuses that mean the work is still ahead of the group. "Needs review" is
+#: included: the milestone is live, only its change awaits approval.
+OPEN_STATUSES = frozenset({"open", "overdue", "needs review"})
+
+#: Neither open nor done: proposed by a recharter that has not been approved.
+_PROPOSED = "proposed in recharter"
+
+
 def is_open(milestone: Dict[str, Any]) -> bool:
-    return milestone_status(milestone) in {"open", "overdue"}
+    return milestone_status(milestone) in OPEN_STATUSES
 
 
 def _parse_date(value: Any) -> Optional[date]:
@@ -237,7 +257,7 @@ def render_milestones(
     """Milestones across groups, soonest due first."""
     groups = load_groups()
     if groups is None:
-        return NOT_GATHERED
+        return not_gathered()
     wanted = status.lower()
     if wanted not in {"open", "overdue", "done", "all"}:
         return "`status` must be one of: open, overdue, done, all."
@@ -263,11 +283,11 @@ def render_milestones(
             current = milestone_status(item)
             if current == "dropped":
                 continue
-            if wanted == "open" and current not in {"open", "overdue", "needs review"}:
+            if wanted == "open" and current not in OPEN_STATUSES:
                 continue
             if wanted == "overdue" and current != "overdue":
                 continue
-            if wanted == "done" and current in {"open", "overdue", "needs review"}:
+            if wanted == "done" and (current in OPEN_STATUSES or current == _PROPOSED):
                 continue
             due = str(item.get("due") or "")
             if due_before and (not due or due > due_before):
@@ -299,7 +319,7 @@ def render_milestones(
 def render_timeline(acronym: str, year: Optional[int] = None) -> str:
     groups = load_groups()
     if groups is None:
-        return NOT_GATHERED
+        return not_gathered()
     if get_group(acronym) is None:
         return f"No chartered group `{acronym}` in the mirror."
     events = load_timeline().get(acronym) or []
@@ -316,8 +336,7 @@ def render_timeline(acronym: str, year: Optional[int] = None) -> str:
         if when[:4] != current_year:
             current_year = when[:4]
             lines += [f"## {current_year}", ""]
-        detail = f" — {event['detail']}" if event.get("detail") else ""
-        lines.append(f"- {when} · {event.get('title', '')}{detail}")
+        lines.append(f"- {when} · {event.get('title', '')}")
     lines += [
         "",
         "_From Datatracker group, charter and milestone records and the RFC "
@@ -347,7 +366,7 @@ def render_group(acronym: str, include_charter: bool = True) -> str:
     """Everything the mirror holds about one group."""
     groups = load_groups()
     if groups is None:
-        return NOT_GATHERED
+        return not_gathered()
     group = get_group(acronym)
     if group is None:
         return (
@@ -363,8 +382,13 @@ def render_group(acronym: str, include_charter: bool = True) -> str:
         facets.append(f"{area} ({group['area']})" if group.get("area") else area)
     lines.append(" · ".join(f for f in facets if f))
     if group.get("charter_rev"):
+        draft = group.get("charter_draft_rev")
+        note = {
+            "rechartering": f"; rechartering in progress (working revision {draft})",
+            "unapproved": "; never approved",
+        }.get(str(group.get("charter_status") or ""), "")
         lines.append(
-            f"**Charter:** rev {group['charter_rev']} — "
+            f"**Charter:** rev {group['charter_rev']}{note} — "
             f"https://datatracker.ietf.org/doc/{group.get('charter_doc')}/"
         )
     if group.get("list_email"):

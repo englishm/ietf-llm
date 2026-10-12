@@ -32,6 +32,7 @@ from ...atomicio import write_if_changed
 from ...config import service as service_config
 from ...freshness import record_gather
 from ...log import LogLevel, Verbosity, log
+from ...paths import get_index_dir
 from ...net import (
     DEFAULT_HEADERS,
     fetch_resource,
@@ -53,6 +54,9 @@ CHARTER_BATCH = 200
 #: Minimum gap between batches while a charter backlog remains, so a first run
 #: trickles in over invocations instead of hammering ietf.org in one.
 _BATCH_INTERVAL = 15 * 60
+
+#: After a failed group-list refresh, wait this long before trying again.
+_FAILURE_BACKOFF = 60 * 60
 
 #: A charter that failed to fetch is not retried for this long.
 _RETRY_AFTER = 7 * 24 * 60 * 60
@@ -213,6 +217,31 @@ def _plain(text: Any) -> str:
     return " ".join(_TAG_RE.sub("", str(text or "")).split())
 
 
+#: Datatracker charter state `approved`; its URI ends in this id.
+_CHARTER_APPROVED = "88"
+
+
+def _approved_rev(charter: Dict[str, Any]) -> Tuple[str, str]:
+    """`(revision of the approved charter, status)` for a charter document.
+
+    A plain revision (`09`) is an approved charter. A dashed one (`01-05`) is
+    a working revision: with a non-zero base, a recharter is in progress and
+    the approved text is the base revision (`01`); with base `00` the charter
+    was never approved. The status is "" when the document's latest revision
+    is the approved one, else `rechartering` or `unapproved`.
+    """
+    rev = str(charter.get("rev") or "")
+    approved_state = any(
+        _slug(s) == _CHARTER_APPROVED for s in charter.get("states") or []
+    )
+    if not rev or "-" not in rev or approved_state:
+        return rev, ""
+    base = rev.split("-", 1)[0]
+    if base.strip("0"):
+        return base, "rechartering"
+    return rev, "unapproved"
+
+
 def build_groups(
     groups: List[Dict[str, Any]],
     areas: List[Dict[str, Any]],
@@ -224,14 +253,15 @@ def build_groups(
         a.get("resource_uri"): (a.get("acronym") or "", a.get("name") or "")
         for a in areas
     }
-    revs = {c.get("group"): (c.get("name"), c.get("rev")) for c in charters}
+    revs = {c.get("group"): c for c in charters}
     out: List[Dict[str, Any]] = []
     for obj in groups:
         acronym = obj.get("acronym") or ""
         if not acronym:
             continue
         area, area_name = parents.get(obj.get("parent") or "", ("", ""))
-        doc, rev = revs.get(obj.get("resource_uri"), (None, None))
+        charter = revs.get(obj.get("resource_uri")) or {}
+        rev, status = _approved_rev(charter)
         out.append(
             {
                 "acronym": acronym,
@@ -241,8 +271,10 @@ def build_groups(
                 "area": area,
                 "area_name": area_name,
                 "description": " ".join((obj.get("description") or "").split()),
-                "charter_doc": doc or "",
-                "charter_rev": rev or "",
+                "charter_doc": charter.get("name") or "",
+                "charter_rev": rev,
+                "charter_status": status,
+                "charter_draft_rev": charter.get("rev") or "" if status else "",
                 "list_email": obj.get("list_email") or "",
                 "uri": obj.get("resource_uri") or "",
             }
@@ -429,6 +461,8 @@ def render_charter_file(
         lines.append(f"Area: {group['area_name']} ({group.get('area', '')})")
     if doc:
         lines.append(f"Source: https://datatracker.ietf.org/doc/{doc}/")
+    if group.get("charter_status") == "unapproved":
+        lines.append("Note: this charter was never approved.")
     lines.append("")
     if text:
         lines += [reader.CHARTER_HEADING, "", text.strip()]
@@ -490,11 +524,12 @@ def ensure_groups_index(
     """
     if service_config.store_backend() == "cloud":
         return
+    reindex = False
     try:
         if seed and not os.path.exists(
             os.path.join(reader.groups_files_dir(), reader.GROUPS_FILE)
         ):
-            install_seed(verbosity)
+            reindex = install_seed(verbosity)
         _ensure(
             verbosity,
             force,
@@ -503,6 +538,7 @@ def ensure_groups_index(
             embed_model,
             embed,
             batch,
+            reindex,
         )
     except Exception as err:  # pylint: disable=broad-except
         log(f"Groups: refresh failed: {err}", verbosity, LogLevel.PROGRESS)
@@ -516,6 +552,7 @@ def _ensure(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     embed_model: Optional[str],
     embed: bool,
     batch: int,
+    reindex: bool,
 ) -> None:
     files = reader.groups_files_dir()
     state = reader.state_dir()
@@ -529,14 +566,20 @@ def _ensure(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     fetched_path = os.path.join(state, "charters.json")
     fetched: Dict[str, Dict[str, Any]] = _read_json(fetched_path, {})
     groups: List[Dict[str, Any]] = _read_json(groups_path, [])
+    failed_stamp = os.path.join(state, "last-failed-refresh")
     stale = force or not _mirror.is_fresh(groups_path, reader.GROUPS_TTL_SECONDS)
+    # A failed refresh leaves the TTL expired, so without this every run would
+    # repeat the bulk requests against a Datatracker that is already struggling.
+    if stale and not force and _mirror.is_fresh(failed_stamp, _FAILURE_BACKOFF):
+        stale = False
     # A stamp of the last charter batch, so a backlog drains across runs
     # without every invocation inside the TTL fetching.
     batch_stamp = os.path.join(state, "last-charter-batch")
     backlog = bool(_pending_charters(groups, fetched, time.time()))
     batch_due = backlog and not _mirror.is_fresh(batch_stamp, _BATCH_INTERVAL)
     if not stale and not batch_due:
-        _index(verbosity, embed_model, embed)
+        if reindex or not _index_built():
+            _index(verbosity, embed_model, embed)
         return
 
     changed = False
@@ -546,17 +589,25 @@ def _ensure(  # pylint: disable=too-many-arguments,too-many-positional-arguments
             files, state, groups_path, fetch, verbosity
         )
         groups = _read_json(groups_path, groups)
+        if refreshed:
+            _mirror.unlink(failed_stamp)
+        else:
+            _touch(failed_stamp)
     texts: Dict[str, str] = {}
     if batch_due or stale:
         texts = _fetch_charter_batch(groups, fetched, charter_fetch, batch, verbosity)
         _touch(batch_stamp)
-    if changed or refreshed or texts:
+    dirty = changed or bool(texts)
+    if dirty or refreshed:
         _write_charter_files(groups, texts)
     _write_json(fetched_path, fetched, verbosity)
     if refreshed:
         _mirror.touch(groups_path)
         record_gather(reader.GROUPS_CORPUS)
-    _index(verbosity, embed_model, embed)
+    # Loading the embedding model is the expensive part of an index pass, so
+    # it only runs when a file it embeds can have changed.
+    if dirty or reindex or not _index_built():
+        _index(verbosity, embed_model, embed)
 
 
 def install_seed(verbosity: Verbosity = Verbosity.STATUS) -> bool:
@@ -614,7 +665,9 @@ def _refresh_derived(
     group_rows = fetch(f"{_API}/group/group/?type__in={_GROUP_TYPES}", verbosity)
     area_rows = fetch(f"{_API}/group/group/?type__in=area,irtf", verbosity)
     charter_rows = fetch(f"{_API}/doc/document/?type=charter", verbosity)
-    if group_rows is None or area_rows is None or charter_rows is None:
+    # An empty list is as unusable as a failed fetch, and worse: it would be
+    # written over the mirror and every charter file deleted with it.
+    if not group_rows or not area_rows or not charter_rows:
         log(
             "Groups: group list unavailable; keeping existing mirror",
             verbosity,
@@ -698,12 +751,20 @@ def _write_charter_files(
         text = texts.get(acronym) or reader.charter_text(acronym)
         content = render_charter_file(group, text, milestones.get(acronym, []))
         write_if_changed(reader.charter_file(acronym), content)
+    if not keep:
+        return
     try:
         for name in os.listdir(reader.charters_dir()):
             if name.endswith(".md") and name not in keep:
                 os.remove(os.path.join(reader.charters_dir(), name))
     except OSError:
         pass
+
+
+def _index_built() -> bool:
+    return os.path.isfile(
+        os.path.join(get_index_dir(), reader.GROUPS_CORPUS, "embeddings.db")
+    )
 
 
 def _index(verbosity: Verbosity, embed_model: Optional[str], embed: bool) -> None:

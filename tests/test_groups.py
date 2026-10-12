@@ -76,6 +76,7 @@ class _Datatracker:
         self.urls: List[str] = []
         self.extra_milestones: List[Dict[str, Any]] = []
         self.fail = False
+        self.empty_groups = False
 
     def __call__(self, url: str, verbosity: Verbosity) -> Optional[List[Dict[str, Any]]]:
         self.urls.append(url)
@@ -84,7 +85,7 @@ class _Datatracker:
         if "type__in=area" in url:
             return list(_AREAS)
         if "type__in=wg,rg" in url and "/group/group/" in url:
-            return list(_GROUPS)
+            return [] if self.empty_groups else list(_GROUPS)
         if "doc/document/?type=charter" in url:
             return list(_CHARTER_DOCS)
         if "groupevent" in url:
@@ -584,3 +585,126 @@ def test_embedded_milestone_text_does_not_depend_on_todays_date(mirror: _Datatra
     text = Path(reader.charter_file("httpbis")).read_text()
     assert "Long past" in text and "overdue" not in text
     assert "overdue" in reader.render_group("httpbis")
+
+
+# --- review follow-ups -------------------------------------------------------
+
+
+def test_done_filter_excludes_proposed_and_review_milestones(mirror: _Datatracker) -> None:
+    mirror.extra_milestones = [
+        _milestone(20, 1, "Proposed one", "2099-05-01", state="charter"),
+        _milestone(21, 1, "Needs a look", "2099-06-01", state="review"),
+    ]
+    _refresh(mirror)
+    done = reader.render_milestones(status="done")
+    assert "Submit semantics" in done
+    assert "Proposed one" not in done and "Needs a look" not in done
+    opened = reader.render_milestones(status="open")
+    assert "Needs a look" in opened and "Proposed one" not in opened
+    assert "Proposed one" in reader.render_milestones(status="all")
+
+
+def test_open_count_agrees_with_the_open_listing(mirror: _Datatracker) -> None:
+    mirror.extra_milestones = [_milestone(21, 1, "Needs a look", "2099-06-01", state="review")]
+    _refresh(mirror)
+    assert "2 open of 3" in reader.render_group("httpbis")
+    assert reader.render_milestones(group="httpbis").startswith("**2 milestones**")
+
+
+def test_unchanged_refresh_does_not_touch_the_embedding_model(
+    indexed: _Datatracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: List[int] = []
+    monkeypatch.setattr(writer, "_index", lambda *a, **k: calls.append(1))
+    _refresh(indexed, force=False)
+    assert calls == []
+    _refresh(indexed, force=True)  # feeds unchanged, nothing re-rendered
+    assert calls == []
+    indexed.extra_milestones = [_milestone(30, 1, "New", "2099-01-01", time_="2026-03-01T00:00:00Z")]
+    _refresh(indexed, force=True)
+    assert calls == [1]
+
+
+def test_missing_index_is_built_even_when_nothing_changed(
+    mirror: _Datatracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: List[int] = []
+    monkeypatch.setattr(writer, "_index", lambda *a, **k: calls.append(1))
+    _refresh(mirror, force=False)
+    assert calls == [1]
+
+
+def test_failed_group_list_is_not_retried_at_once(isolated_home: Path) -> None:
+    _seed_rfc_mirror(isolated_home)
+    dt = _Datatracker()
+    dt.fail = True
+    _refresh(dt, force=True)
+    first = len(dt.urls)
+    assert first
+    _refresh(dt, force=False)
+    assert len(dt.urls) == first
+    dt.fail = False
+    _refresh(dt, force=True)
+    assert reader.load_groups()
+    _refresh(dt, force=False)  # recovered: the failure stamp is gone
+
+
+def test_empty_group_list_does_not_wipe_the_mirror(mirror: _Datatracker) -> None:
+    mirror.empty_groups = True
+    _refresh(mirror)
+    assert reader.get_group("httpbis") is not None
+    assert reader.charter_text("httpbis")
+
+
+def test_recharter_in_progress_shows_the_approved_revision(mirror: _Datatracker) -> None:
+    _CHARTER_DOCS[0]["rev"] = "09-02"
+    seen: List[str] = []
+
+    def spy(doc: str, rev: str) -> Optional[str]:
+        seen.append(rev)
+        return _charter_fetch(doc, rev)
+
+    try:
+        writer.ensure_groups_index(Verbosity.QUIET, fetch=mirror, charter_fetch=spy, force=True, embed=False)
+    finally:
+        _CHARTER_DOCS[0]["rev"] = "09"
+    group = reader.get_group("httpbis")
+    assert group and group["charter_rev"] == "09" and group["charter_status"] == "rechartering"
+    assert "working revision 09-02" in reader.render_group("httpbis")
+    assert "09-02" not in seen
+
+
+def test_never_approved_charter_is_flagged(mirror: _Datatracker) -> None:
+    _CHARTER_DOCS[1]["rev"] = "00-03"
+    try:
+        _refresh(mirror)
+    finally:
+        _CHARTER_DOCS[1]["rev"] = "05"
+    group = reader.get_group("l3vpn")
+    assert group and group["charter_rev"] == "00-03" and group["charter_status"] == "unapproved"
+    assert "never approved" in reader.render_group("l3vpn")
+    assert "never approved" in Path(reader.charter_file("l3vpn")).read_text()
+
+
+def test_approved_state_keeps_a_dashed_revision(mirror: _Datatracker) -> None:
+    assert writer._approved_rev({"rev": "20-02", "states": ["/api/v1/doc/state/88/"]}) == ("20-02", "")  # pylint: disable=protected-access
+
+
+def test_not_gathered_message_is_honest_on_cloud(isolated_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ARG001
+    monkeypatch.setenv("IETF_LLM_STORE_BACKEND", "cloud")
+    assert "cloud backend" in reader.render_group("httpbis")
+    assert "next time you run" not in reader.render_group("httpbis")
+
+
+def test_resolved_args_are_not_merged_twice(isolated_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ARG001
+    import argparse  # pylint: disable=import-outside-toplevel
+
+    from ietf_llm import config  # pylint: disable=import-outside-toplevel
+    from ietf_llm.gather.sequencer import embed_settings  # pylint: disable=import-outside-toplevel
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("merged again")
+
+    monkeypatch.setattr(config, "merge_global", boom)
+    args = argparse.Namespace(embed_model="m", no_embed=False, _global_sources={})
+    assert embed_settings(args) == ("m", True)
