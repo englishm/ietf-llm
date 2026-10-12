@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..corpus import kind_status
 from ..paths import get_cache_dir
+from . import groups as group_mirror
 
 #: Cache subdirectory for the effort-catalog singleton.
 CATALOG_DIR = "_catalog"
@@ -154,6 +155,48 @@ def _rank(efforts: List[Dict[str, Any]], terms: List[str]) -> List[Dict[str, Any
     return [effort for _, _, effort in scored]
 
 
+#: Reciprocal-rank-fusion constant: how fast a list's contribution falls off
+#: with rank. 60 is the conventional value and nothing here is sensitive to it.
+_RRF_K = 60
+
+#: A concluded group is a weaker answer to "what is the IETF doing", so it
+#: loses to an active group that matches equally well.
+_CLOSED_FACTOR = 0.6
+
+
+def _candidates() -> Optional[List[Dict[str, Any]]]:
+    """Every effort to rank: the chartered-group mirror (active, BoF and
+    concluded) when present, else the active-only catalog."""
+    return group_mirror.load_groups() or _load()
+
+
+def _fuse(
+    efforts: List[Dict[str, Any]], terms: List[str], semantic: List[str]
+) -> List[Dict[str, Any]]:
+    """Blend keyword ranking with charter-embedding ranking.
+
+    Each list contributes by rank rather than raw score, since the two
+    scores are not comparable. When the whole query is one group's acronym it
+    is pinned first: the user named the group, and no topic score should
+    outrank that. (In a longer query a word equal to an acronym is just a
+    word, as in "http caching".)
+    """
+    keyword = _rank(efforts, terms)
+    by_acronym = {e.get("acronym", ""): e for e in efforts}
+    scores: Dict[str, float] = {}
+    for ranking in ([e.get("acronym", "") for e in keyword], semantic):
+        for rank, acronym in enumerate(a for a in ranking if a in by_acronym):
+            scores[acronym] = scores.get(acronym, 0.0) + 1.0 / (_RRF_K + rank)
+    for acronym, effort in by_acronym.items():
+        if acronym in scores:
+            if group_mirror.is_closed(effort):
+                scores[acronym] *= _CLOSED_FACTOR
+            if len(terms) == 1 and _clean(acronym) == terms[0]:
+                scores[acronym] += 1.0
+    ordered = sorted(scores, key=lambda a: (-scores[a], a))
+    return [by_acronym[a] for a in ordered]
+
+
 # --- Cached-tag + rendering ------------------------------------------------
 
 
@@ -197,6 +240,8 @@ def _state_label(effort: Dict[str, Any]) -> str:
     """
     if _is_bof(effort):
         return "**BoF — pre-WG, not chartered**"
+    if group_mirror.is_closed(effort):
+        return group_mirror.state_label(effort)
     return str(effort.get("state") or "").strip().lower()
 
 
@@ -207,24 +252,31 @@ def _truncate(text: str, limit: int = 200) -> str:
     return text[:limit].rstrip() + "…"
 
 
-def render_efforts(query: str, limit: int = 15) -> str:
-    """Rank active IETF/IRTF efforts by a free-text topic; return a
-    compact markdown list, each tagged with whether it is cached here."""
-    catalog = _load()
+def render_efforts(
+    query: str, limit: int = 15, semantic: Optional[List[str]] = None
+) -> str:
+    """Rank IETF/IRTF efforts by a free-text topic; return a compact
+    markdown list, each tagged with whether it is cached here.
+
+    `semantic` is the acronyms of groups whose charters matched the query
+    in the embedding index, best first; the caller supplies it because
+    this module stays free of the embedding stack.
+    """
+    catalog = _candidates()
     if catalog is None:
         return _NOT_GATHERED
     terms = _terms(query)
     if not terms:
         return 'Give a topic to search for, e.g. `find_efforts("congestion control")`.'
-    ranked = _rank(catalog, terms)
+    ranked = _fuse(catalog, terms, semantic or [])
     total = len(ranked)
     shown = ranked[: max(0, limit)]
     if not shown:
         return (
-            f"No active efforts match `{query}`. The catalog covers active "
-            "working and research groups only — a concluded effort or one "
-            "framed differently may not surface; try `search_rfc_index` for "
-            "published work, or broaden the topic."
+            f"No efforts match `{query}`. This covers chartered working and "
+            "research groups (active and concluded) and BoFs; work done "
+            "outside a group, or framed differently, may not surface. Try "
+            "`search_rfc_index` for published work, or broaden the topic."
         )
     header = f"**{total} effort{'s' if total != 1 else ''}** for `{query}`"
     if len(shown) < total:
@@ -247,7 +299,11 @@ def render_efforts(query: str, limit: int = 15) -> str:
         lines.append(
             f"- **{acronym}** — {effort.get('name', '(unnamed)')}{suffix} · {tag}"
         )
-        desc = _truncate(effort.get("description", ""))
+        desc = (
+            group_mirror.summary(effort)
+            if effort.get("charter_doc") is not None
+            else _truncate(effort.get("description", ""))
+        )
         if desc:
             lines.append(f"  {desc}")
     if any_bof:

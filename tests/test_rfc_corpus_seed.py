@@ -294,7 +294,7 @@ def test_init_runs_the_housekeeping_without_a_corpus_name(
 
     ran: List[bool] = []
     monkeypatch.setattr(
-        cli_main, "_housekeeping", lambda v, forced=False: ran.append(forced)
+        cli_main, "_housekeeping", lambda v, forced=False, **_kw: ran.append(forced)
     )
     monkeypatch.setattr(_sys, "argv", ["ietf-llm", "--init"])
     with pytest.raises(SystemExit) as exc:
@@ -314,7 +314,7 @@ def test_init_reports_the_state_it_leaves(
 
     from ietf_llm.cli import main as cli_main
 
-    monkeypatch.setattr(cli_main, "_housekeeping", lambda v, forced=False: None)
+    monkeypatch.setattr(cli_main, "_housekeeping", lambda v, forced=False, **_kw: None)
     monkeypatch.setattr(_sys, "argv", ["ietf-llm", "--init"])
     _install_local("20260811T003915Z+2")
     with pytest.raises(SystemExit):
@@ -331,7 +331,7 @@ def test_init_says_so_when_the_corpus_is_missing(
 
     from ietf_llm.cli import main as cli_main
 
-    monkeypatch.setattr(cli_main, "_housekeeping", lambda v, forced=False: None)
+    monkeypatch.setattr(cli_main, "_housekeeping", lambda v, forced=False, **_kw: None)
     monkeypatch.setattr(_sys, "argv", ["ietf-llm", "--init"])
     with pytest.raises(SystemExit):
         cli_main.main()
@@ -352,7 +352,7 @@ def test_init_reports_why_the_corpus_is_missing(
     from ietf_llm.cli import main as cli_main
 
     monkeypatch.setattr(
-        cli_main, "_housekeeping", lambda v, forced=False: "seeding is disabled"
+        cli_main, "_housekeeping", lambda v, forced=False, **_kw: "seeding is disabled"
     )
     monkeypatch.setattr(_sys, "argv", ["ietf-llm", "--init"])
     with pytest.raises(SystemExit):
@@ -379,7 +379,7 @@ def test_init_seed_re_enables_seeding_before_installing(
     monkeypatch.setattr(
         cli_main,
         "_housekeeping",
-        lambda v, forced=False: seen.append(service_config.seeding_enabled()),
+        lambda v, forced=False, **_kw: seen.append(service_config.seeding_enabled()),
     )
     monkeypatch.setattr(_sys, "argv", ["ietf-llm", "--init", "--seed"])
     with pytest.raises(SystemExit) as exc:
@@ -398,7 +398,7 @@ def test_init_without_the_flag_leaves_the_toggle_alone(
     from ietf_llm.config import service as service_config
 
     service_config.set_seeding_enabled(False)
-    monkeypatch.setattr(cli_main, "_housekeeping", lambda v, forced=False: None)
+    monkeypatch.setattr(cli_main, "_housekeeping", lambda v, forced=False, **_kw: None)
     monkeypatch.setattr(_sys, "argv", ["ietf-llm", "--init"])
     with pytest.raises(SystemExit):
         cli_main.main()

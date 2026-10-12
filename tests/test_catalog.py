@@ -202,7 +202,7 @@ def test_short_term_only_matches_acronym(isolated_home: Path) -> None:
     # "ai" is below PREFIX_LEN: it must not match the "ai" inside "email",
     # but it should still match nothing-vs-acronym cleanly (no crash).
     out = catalog.render_efforts("ai")
-    assert "No active efforts match" in out
+    assert "No efforts match" in out
 
 
 def test_acronym_short_term_matches(isolated_home: Path) -> None:
@@ -227,7 +227,7 @@ def test_multi_term_scores_accumulate(isolated_home: Path) -> None:
 
 def test_no_match_message(isolated_home: Path) -> None:
     _seed_catalog(isolated_home, [_effort("quic", "QUIC", "transport")])
-    assert "No active efforts match" in catalog.render_efforts("zzzplausible")
+    assert "No efforts match" in catalog.render_efforts("zzzplausible")
 
 
 def test_empty_query_message(isolated_home: Path) -> None:
