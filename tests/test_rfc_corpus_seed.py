@@ -413,6 +413,7 @@ def test_housekeeping_hands_back_the_corpus_reason(
 
     monkeypatch.setattr(cli_main, "ensure_rfc_index", lambda v: None)
     monkeypatch.setattr(cli_main, "ensure_catalog_index", lambda v: None)
+    monkeypatch.setattr(cli_main, "ensure_groups_index", lambda v, **kw: None)
     monkeypatch.setattr(cli_main, "sync_if_pristine", lambda v: None)
     monkeypatch.setattr(
         cli_main, "ensure_rfc_corpus", lambda v, interval=None: "no store"

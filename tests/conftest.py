@@ -84,6 +84,22 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _no_groups_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the chartered-group mirror's refresh off the network.
+
+    Housekeeping runs it after every gather, so any test that drives the CLI
+    end to end would otherwise fetch the live Datatracker (about 130 bulk
+    requests, then ~900 charters) and stall for minutes. A fetcher returning
+    None is a failed fetch, which the writer already tolerates. Tests of the
+    writer inject their own `fetch` / `charter_fetch`.
+    """
+    from ietf_llm.gather.sources import groups  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(groups, "_fetch_all", lambda url, verbosity: None)
+    monkeypatch.setattr(groups, "_fetch_charter", lambda doc, rev: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_datatracker(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub Datatracker-touching code paths in every test.
 
