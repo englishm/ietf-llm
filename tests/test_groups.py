@@ -19,6 +19,7 @@ import pytest
 from ietf_llm import embeddings
 from ietf_llm.embeddings import chunking
 from ietf_llm.gather.sources import groups as writer
+from ietf_llm.gather.sources.groups import _fetch_charter as real_fetch_charter
 from ietf_llm.log import Verbosity
 from ietf_llm.mcp import groups as tools
 from ietf_llm.paths import get_cache_dir
@@ -286,19 +287,99 @@ def test_group_without_charter_text_falls_back_to_description(isolated_home: Pat
     assert "## Description" in Path(reader.charter_file("httpbis")).read_text()
 
 
-def test_failed_charter_is_not_retried_at_once(isolated_home: Path) -> None:
+def test_absent_charter_is_not_asked_for_again_at_once(isolated_home: Path) -> None:
     _seed_rfc_mirror(isolated_home)
     dt = _Datatracker()
     calls: List[str] = []
 
-    def failing(doc: str, rev: str) -> Optional[str]:  # noqa: ARG001
+    def absent(doc: str, rev: str) -> Optional[str]:  # noqa: ARG001
+        calls.append(doc)
+        return ""
+
+    for _ in range(2):
+        writer.ensure_groups_index(Verbosity.QUIET, fetch=dt, charter_fetch=absent, force=True, embed=False)
+    assert len(calls) == 3
+
+
+def test_transient_failure_is_retried_on_the_next_batch(isolated_home: Path) -> None:
+    _seed_rfc_mirror(isolated_home)
+    dt = _Datatracker()
+    calls: List[str] = []
+
+    def down(doc: str, rev: str) -> Optional[str]:  # noqa: ARG001
         calls.append(doc)
         return None
 
-    writer.ensure_groups_index(Verbosity.QUIET, fetch=dt, charter_fetch=failing, force=True, embed=False)
-    first = len(calls)
-    writer.ensure_groups_index(Verbosity.QUIET, fetch=dt, charter_fetch=failing, force=True, embed=False)
-    assert first == 3 and len(calls) == 3
+    writer.ensure_groups_index(Verbosity.QUIET, fetch=dt, charter_fetch=down, force=True, embed=False)
+    assert len(calls) == 3 and not reader.charter_text("httpbis")
+    writer.ensure_groups_index(Verbosity.QUIET, fetch=dt, charter_fetch=_charter_fetch, force=True, embed=False)
+    assert reader.charter_text("httpbis") and reader.charter_text("l3vpn")
+
+
+def _fake_groups(n: int) -> List[Dict[str, Any]]:
+    return [{"acronym": f"g{i:02d}", "state": "active", "charter_doc": f"charter-ietf-g{i:02d}",
+             "charter_rev": "01"} for i in range(n)]
+
+
+def test_batch_stops_after_consecutive_transient_failures() -> None:
+    calls: List[str] = []
+
+    def down(doc: str, rev: str) -> Optional[str]:  # noqa: ARG001
+        calls.append(doc)
+        return None
+
+    fetched: Dict[str, Dict[str, Any]] = {}
+    texts = writer._fetch_charter_batch(_fake_groups(12), fetched, down, 100, Verbosity.QUIET)  # pylint: disable=protected-access
+    assert len(calls) == 5 and texts == {} and fetched == {}
+
+
+def test_a_success_resets_the_failure_streak() -> None:
+    answers = iter([None] * 4 + ["text"] + [None] * 4 + ["text"])
+
+    def flaky(doc: str, rev: str) -> Optional[str]:  # noqa: ARG001
+        return next(answers)
+
+    fetched: Dict[str, Dict[str, Any]] = {}
+    texts = writer._fetch_charter_batch(_fake_groups(10), fetched, flaky, 100, Verbosity.QUIET)  # pylint: disable=protected-access
+    assert len(texts) == 2 and len(fetched) == 2
+
+
+def test_absent_revisions_do_not_end_a_batch() -> None:
+    fetched: Dict[str, Dict[str, Any]] = {}
+    texts = writer._fetch_charter_batch(_fake_groups(8), fetched, lambda d, r: "", 100, Verbosity.QUIET)  # pylint: disable=protected-access
+    assert texts == {} and len(fetched) == 8 and not any(v["ok"] for v in fetched.values())
+
+
+class _Response:
+    def __init__(self, status: int, text: str = "") -> None:
+        self.status_code = status
+        self.text = text
+        self.content = text.encode()
+
+    @property
+    def ok(self) -> bool:
+        return self.status_code < 400
+
+
+def _fetch_with(monkeypatch: pytest.MonkeyPatch, outcome: Any) -> Optional[str]:
+    def fake_get(url: str, **_kw: Any) -> Any:  # noqa: ARG001
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(writer, "governed_get", fake_get)
+    return real_fetch_charter("charter-ietf-x", "01")
+
+
+def test_charter_fetch_distinguishes_absent_from_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import requests  # pylint: disable=import-outside-toplevel
+
+    assert _fetch_with(monkeypatch, _Response(200, "the charter")) == "the charter"
+    assert _fetch_with(monkeypatch, _Response(404, "<html>")) == ""
+    assert _fetch_with(monkeypatch, _Response(503, "busy")) is None
+    assert _fetch_with(monkeypatch, _Response(429, "slow down")) is None
+    assert _fetch_with(monkeypatch, _Response(200, "")) is None
+    assert _fetch_with(monkeypatch, requests.ConnectionError("down")) is None
 
 
 def test_new_charter_revision_is_refetched(mirror: _Datatracker) -> None:
@@ -708,3 +789,49 @@ def test_resolved_args_are_not_merged_twice(isolated_home: Path, monkeypatch: py
     monkeypatch.setattr(config, "merge_global", boom)
     args = argparse.Namespace(embed_model="m", no_embed=False, _global_sources={})
     assert embed_settings(args) == ("m", True)
+
+
+# --- index retry ------------------------------------------------------------
+
+
+def _model_availability(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
+    """Make the embedding model come and go without undoing other patches
+    (which would also undo the sandboxed HOME)."""
+    embeddings._MODEL_CACHE["stub"] = _AreaModel()  # pylint: disable=protected-access
+    state: Dict[str, Any] = {"model": None}
+    monkeypatch.setattr(embeddings, "_get_embed_model", lambda name, verbose: state["model"])
+    return state
+
+
+def test_failed_index_build_is_retried_though_nothing_changed(
+    mirror: _Datatracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    available = _model_availability(monkeypatch)
+    _refresh(mirror, embed=True, embed_model="stub", force=False)
+    assert not tools.index_installed()
+    assert (Path(reader.state_dir()) / "index-pending").exists()
+    available["model"] = _AreaModel()
+    _refresh(mirror, embed=True, embed_model="stub", force=False)  # no feed or file change
+    assert tools.index_installed()
+    assert not (Path(reader.state_dir()) / "index-pending").exists()
+
+
+def test_stale_index_is_rebuilt_after_a_failure_that_left_it_behind(
+    indexed: _Datatracker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: List[int] = []
+    real = writer._index  # pylint: disable=protected-access
+    available = _model_availability(monkeypatch)
+    indexed.extra_milestones = [_milestone(40, 1, "Changed", "2099-01-01", time_="2026-04-01T00:00:00Z")]
+    _refresh(indexed, embed=True, embed_model="stub", force=True)
+    assert (Path(reader.state_dir()) / "index-pending").exists()
+    available["model"] = _AreaModel()
+    monkeypatch.setattr(writer, "_index", lambda *a, **k: calls.append(1) or real(*a, **k))
+    _refresh(indexed, embed=True, embed_model="stub", force=False)
+    assert calls == [1]
+    assert not (Path(reader.state_dir()) / "index-pending").exists()
+
+
+def test_nothing_pending_means_no_model_load(indexed: _Datatracker, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(writer, "_index", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
+    _refresh(indexed, embed=True, embed_model="stub", force=False)
