@@ -1348,10 +1348,14 @@ into `time__gte=<watermark>`, rows merge by id, and a failed page keeps the
 stored rows and the old watermark. A first full refresh is about 130 requests;
 a daily one is a handful. The one per-group fetch is the charter text (about
 900 groups have a charter document), capped per run (`CHARTER_BATCH`) with active
-groups first, and repeated only when a group's charter revision moves. A fetch
-that fails is not retried for a week, and a failed or empty group-list refresh is
-not retried for an hour (an empty list is treated as a failure, never written over
-the mirror). While a backlog remains, batches run at
+groups first, and repeated only when a group's charter revision moves. A
+charter the server says is absent (404 or 410) is recorded as such and not asked for
+again for a week. A transient failure (network error, throttling, a 5xx, an empty
+body) leaves it pending but is counted: after five failures it is set aside for a day,
+so one that always fails cannot hold the front of the queue, and a batch stops after
+five failures in a row so it does not hammer a server that is unwell. A
+failed or empty group-list refresh is not retried for an hour (an empty list is
+treated as a failure, never written over the mirror). While a backlog remains, batches run at
 most every 15 minutes, so a first run on a machine with no seed trickles in over
 several invocations.
 
@@ -1363,9 +1367,12 @@ it is still searchable. The chunker (`_chunk_charter_file`) stamps each chunk wi
 scopes by area, state or kind through the existing facet filters. A
 milestone-only change re-renders the file from the stored charter without
 refetching it, and the embedder's per-file content hash re-embeds just that file.
-The index pass (which loads the embedding model) runs only when a rendered file
-changed, a snapshot was just installed, or no index exists yet, not on every
-housekeeping run. Milestone lines in the embedded text are rendered without a
+The index pass (which loads the embedding model) runs only when one is owed: a
+rendered file changed, a snapshot was just installed, a previous pass did not
+complete, or no index exists yet; not on every housekeeping run. Ownership is a stamp
+(`files/state/index-pending`) cleared only by a pass that completed, so a machine
+without the embedding library keeps trying and never serves an index that is quietly
+behind its files. Milestone lines in the embedded text are rendered without a
 date-relative status, so a milestone slipping into the past does not change the file.
 
 **Seeding.** The publisher treats `_groups` as an ordinary member of the main

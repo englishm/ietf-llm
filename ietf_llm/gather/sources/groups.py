@@ -35,7 +35,6 @@ from ...log import LogLevel, Verbosity, log
 from ...paths import get_index_dir
 from ...net import (
     DEFAULT_HEADERS,
-    fetch_resource,
     governed_get,
     http_error_detail,
     http_metrics,
@@ -58,8 +57,20 @@ _BATCH_INTERVAL = 15 * 60
 #: After a failed group-list refresh, wait this long before trying again.
 _FAILURE_BACKOFF = 60 * 60
 
-#: A charter that failed to fetch is not retried for this long.
+#: A charter the server says does not exist is not asked for again for this long.
 _RETRY_AFTER = 7 * 24 * 60 * 60
+
+#: Responses that mean the revision is not coming back.
+_ABSENT_STATUSES = frozenset({404, 410})
+
+#: A charter that fails transiently this many times is set aside for a day, so
+#: one that fails every time cannot hold the front of the queue indefinitely.
+_MAX_TRIES = 5
+_TRANSIENT_LOCKOUT = 24 * 60 * 60
+
+#: A batch stops after this many transient failures in a row. They mean the
+#: network or the server is unwell, and carrying on would only add load.
+_MAX_CONSECUTIVE_FAILURES = 5
 
 _GROUP_TYPES = "wg,rg"
 
@@ -478,8 +489,50 @@ def render_charter_file(
 
 
 def _fetch_charter(doc: str, rev: str) -> Optional[str]:
-    res = fetch_resource(f"https://www.ietf.org/charter/{doc}-{rev}.txt")
-    return res.text if res is not None and res.text else None
+    """The text of one charter revision.
+
+    Three outcomes, because the caller treats them differently: the text; `""`
+    when the server says the revision does not exist (404, or 410 Gone), which
+    is permanent and worth remembering; and None for anything else (network error, throttling,
+    a server error, an empty body), which is transient and must not be.
+    """
+    url = f"https://www.ietf.org/charter/{doc}-{rev}.txt"
+    try:
+        response = governed_get(url, headers=dict(DEFAULT_HEADERS), timeout=_TIMEOUT)
+    except requests.RequestException as err:
+        http_metrics.record(url, 0, 0, error=True)
+        log(
+            f"Groups: fetch {url} failed: {http_error_detail(err)}", level=LogLevel.WARN
+        )
+        return None
+    size = len(response.content)
+    if response.status_code in _ABSENT_STATUSES:
+        http_metrics.record(url, response.status_code, size, error=True)
+        return ""
+    if not response.ok or not response.text:
+        http_metrics.record(url, response.status_code, size, error=True)
+        log(f"Groups: fetch {url} returned {response.status_code}", level=LogLevel.WARN)
+        return None
+    http_metrics.record(url, response.status_code, size)
+    return response.text
+
+
+def _is_pending(have: Dict[str, Any], now: float) -> bool:
+    """Whether a recorded attempt at a charter revision still leaves it owed.
+
+    A fetched charter is done. One the server said is absent waits out
+    `_RETRY_AFTER`, as does a record from before attempts were counted. One
+    that failed transiently stays owed until it has failed `_MAX_TRIES` times,
+    then waits out `_TRANSIENT_LOCKOUT`.
+    """
+    if have.get("ok"):
+        return False
+    age = float(now - have.get("at", 0))
+    if have.get("absent") or "tries" not in have:
+        return age >= _RETRY_AFTER
+    if have["tries"] >= _MAX_TRIES:
+        return age >= _TRANSIENT_LOCKOUT
+    return True
 
 
 def _pending_charters(
@@ -491,9 +544,8 @@ def _pending_charters(
         if not group.get("charter_doc") or not group.get("charter_rev"):
             continue
         have = fetched.get(group["acronym"], {})
-        if have.get("rev") == group["charter_rev"]:
-            if have.get("ok") or now - have.get("at", 0) < _RETRY_AFTER:
-                continue
+        if have.get("rev") == group["charter_rev"] and not _is_pending(have, now):
+            continue
         pending.append(group)
     pending.sort(key=lambda g: (reader.is_closed(g), g["acronym"]))
     return pending
@@ -577,9 +629,11 @@ def _ensure(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     batch_stamp = os.path.join(state, "last-charter-batch")
     backlog = bool(_pending_charters(groups, fetched, time.time()))
     batch_due = backlog and not _mirror.is_fresh(batch_stamp, _BATCH_INTERVAL)
+    pending_stamp = os.path.join(state, "index-pending")
     if not stale and not batch_due:
-        if reindex or not _index_built():
-            _index(verbosity, embed_model, embed)
+        if reindex:
+            _touch(pending_stamp)
+        _refresh_index(pending_stamp, verbosity, embed_model, embed)
         return
 
     changed = False
@@ -604,10 +658,9 @@ def _ensure(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     if refreshed:
         _mirror.touch(groups_path)
         record_gather(reader.GROUPS_CORPUS)
-    # Loading the embedding model is the expensive part of an index pass, so
-    # it only runs when a file it embeds can have changed.
-    if dirty or reindex or not _index_built():
-        _index(verbosity, embed_model, embed)
+    if dirty or reindex:
+        _touch(pending_stamp)
+    _refresh_index(pending_stamp, verbosity, embed_model, embed)
 
 
 def install_seed(verbosity: Verbosity = Verbosity.STATUS) -> bool:
@@ -712,23 +765,44 @@ def _fetch_charter_batch(
     verbosity: Verbosity,
 ) -> Dict[str, str]:
     """Fetch up to `batch` pending charters. Returns the texts obtained and
-    records each attempt in `fetched`; the caller persists both, files first,
-    so a record never claims text that was not written."""
+    records the outcome of each in `fetched`; the caller persists both, files
+    first, so a record never claims text that was not written.
+
+    A definite answer (the text, or "no such revision") is recorded as such. A
+    transient failure is only counted against the charter, which stays pending
+    until it has failed `_MAX_TRIES` times, and several in a row end this
+    batch. Recording them as final would block a charter for the retry window
+    over a network blip, and not counting them would let one that always
+    fails sit at the front of the queue forever.
+    """
     now = time.time()
     pending = _pending_charters(groups, fetched, now)[: max(0, batch)]
     texts: Dict[str, str] = {}
+    missing = transient = streak = 0
     for group in pending:
-        text = charter_fetch(group["charter_doc"], group["charter_rev"])
-        fetched[group["acronym"]] = {
-            "rev": group["charter_rev"],
-            "ok": text is not None,
-            "at": now,
-        }
-        if text is not None:
-            texts[group["acronym"]] = text
+        acronym, rev = group["acronym"], group["charter_rev"]
+        text = charter_fetch(group["charter_doc"], rev)
+        if text is None:
+            transient += 1
+            streak += 1
+            have = fetched.get(acronym, {})
+            tries = have.get("tries", 0) if have.get("rev") == rev else 0
+            fetched[acronym] = {"rev": rev, "ok": False, "at": now, "tries": tries + 1}
+            if streak >= _MAX_CONSECUTIVE_FAILURES:
+                break
+            continue
+        streak = 0
+        fetched[acronym] = {"rev": rev, "ok": bool(text), "at": now}
+        if text:
+            texts[acronym] = text
+        else:
+            fetched[acronym]["absent"] = True
+            missing += 1
     if pending:
         log(
-            f"Groups: fetched {len(texts)}/{len(pending)} charters",
+            f"Groups: {len(texts)}/{len(pending)} charters fetched"
+            f" ({missing} absent, {transient} failed)"
+            + (", stopping early" if streak >= _MAX_CONSECUTIVE_FAILURES else ""),
             verbosity,
             LogLevel.PROGRESS,
         )
@@ -767,21 +841,45 @@ def _index_built() -> bool:
     )
 
 
-def _index(verbosity: Verbosity, embed_model: Optional[str], embed: bool) -> None:
-    """Embed the rendered charters. Incremental on file content, so a refresh
-    that changed nothing is a no-op. Needs the embedding stack, so it is
-    imported here and any failure is the index's alone."""
-    if not embed or not os.path.isdir(reader.charters_dir()):
-        return
-    # pylint: disable-next=import-outside-toplevel
-    from ...embeddings import DEFAULT_EMBED_MODEL, build_index
+def _refresh_index(
+    pending_stamp: str, verbosity: Verbosity, embed_model: Optional[str], embed: bool
+) -> None:
+    """Build the charter index if a file it embeds may have changed.
 
+    Loading the embedding model is the expensive part, so this runs only when
+    the stamp says an earlier pass is owed (a file changed, a snapshot was
+    installed, or that pass failed) or no index exists. The stamp is cleared
+    only by a pass that completed, so a machine without the embedding library
+    keeps trying rather than quietly serving an index that is behind its files.
+    """
+    if not (os.path.exists(pending_stamp) or not _index_built()):
+        return
+    if _index(verbosity, embed_model, embed):
+        _mirror.unlink(pending_stamp)
+
+
+def _index(verbosity: Verbosity, embed_model: Optional[str], embed: bool) -> bool:
+    """Embed the rendered charters; True if the index is now current. Needs the
+    embedding stack, so it is imported here and any failure is the index's
+    alone. Incremental on file content, so a pass over unchanged files is cheap."""
+    if not embed or not os.path.isdir(reader.charters_dir()):
+        return False
+    # pylint: disable-next=import-outside-toplevel
+    from ...embeddings import DEFAULT_EMBED_MODEL, _get_embed_model, build_index
+
+    model_name = embed_model or DEFAULT_EMBED_MODEL
+    # build_index reports an unavailable model as "nothing changed", which is
+    # indistinguishable from success, so ask first.
+    if _get_embed_model(model_name, verbosity) is None:
+        return False
     try:
         build_index(
             reader.GROUPS_CORPUS,
             reader.groups_files_dir(),
-            model_name=embed_model or DEFAULT_EMBED_MODEL,
+            model_name=model_name,
             verbose=verbosity,
         )
     except Exception as err:  # pylint: disable=broad-except
         log(f"Groups: charter index not built: {err}", verbosity, LogLevel.PROGRESS)
+        return False
+    return True
