@@ -20,8 +20,9 @@ import sys
 from typing import Optional
 
 from ..gather.cli import build_parser
-from ..gather.sequencer import _gather_one, _persist_seed_toggle
+from ..gather.sequencer import _gather_one, _persist_seed_toggle, embed_settings
 from ..gather.sources.catalog import ensure_catalog_index
+from ..gather.sources.groups import ensure_groups_index
 from ..gather.sources.repo_discovery import print_discovery
 from ..gather.sources.rfc_corpus import ensure_rfc_corpus
 from ..gather.sources.rfcs import ensure_rfc_index
@@ -49,6 +50,7 @@ def _init_report(rfc_corpus_reason: Optional[str] = None) -> None:
     # pylint: disable=import-outside-toplevel
     from ..gather.sources.rfc_corpus import local_build
     from ..singletons import catalog as catalog_reader
+    from ..singletons import groups as group_reader
     from ..singletons.rfcs import _load as load_rfcs
 
     # pylint: enable=import-outside-toplevel
@@ -75,9 +77,20 @@ def _init_report(rfc_corpus_reason: Optional[str] = None) -> None:
         if efforts
         else "Efforts:       catalog not available"
     )
+    chartered = group_reader.load_groups()
+    if chartered:
+        held = sum(1 for g in chartered if group_reader.charter_text(g["acronym"]))
+        print(f"Groups:        {len(chartered):,} chartered, {held:,} charters held")
+    else:
+        print("Groups:        chartered-group mirror not available")
 
 
-def _housekeeping(verbosity: Verbosity, forced: bool = False) -> Optional[str]:
+def _housekeeping(
+    verbosity: Verbosity,
+    forced: bool = False,
+    embed_model: Optional[str] = None,
+    embed: bool = True,
+) -> Optional[str]:
     """Refresh the mirrors and skills a gather keeps current.
 
     Best-effort, never blocks exit. Runs after every gather — and on its own
@@ -95,6 +108,7 @@ def _housekeeping(verbosity: Verbosity, forced: bool = False) -> Optional[str]:
     else:
         reason = ensure_rfc_corpus(verbosity)
     ensure_catalog_index(verbosity)
+    ensure_groups_index(verbosity, force=forced, embed_model=embed_model, embed=embed)
     sync_if_pristine(verbosity)
     return reason
 
@@ -151,7 +165,8 @@ def main() -> None:  # pylint: disable=too-many-branches,too-many-statements
         # to report — seeding turned off — is a gather, which is exactly what
         # the user of this flag does not have a corpus for.
         _persist_seed_toggle(args)
-        reason = _housekeeping(verbosity, forced=True)
+        model, embed = embed_settings(args)
+        reason = _housekeeping(verbosity, forced=True, embed_model=model, embed=embed)
         if verbosity is not Verbosity.QUIET:
             _init_report(reason)
         sys.exit(0)
@@ -203,7 +218,8 @@ def main() -> None:  # pylint: disable=too-many-branches,too-many-statements
     else:
         _gather_one(args, verbosity)
 
-    _housekeeping(verbosity)
+    model, embed = embed_settings(args)
+    _housekeeping(verbosity, embed_model=model, embed=embed)
 
 
 if __name__ == "__main__":  # pragma: no cover

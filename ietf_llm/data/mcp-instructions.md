@@ -37,8 +37,18 @@ means, call `find_efforts(topic)`; ask only if that doesn't resolve it.
 
 - **Start with `overview(corpus)`** for structural questions ("what is X doing",
   "who's on X", "open issues"), and **`list_corpora`** to see what's gathered.
-- **No named corpus, just a topic?** `find_efforts(topic)` ranks active efforts
-  and flags which are cached; `which_corpus(query)` routes to a cached one.
+- **No named corpus, just a topic?** `find_efforts(topic)` ranks chartered
+  groups by name, description and charter (concluded ones included, labelled and
+  ranked below active ones) and flags which are cached; `which_corpus(query)`
+  routes to a cached one.
+- **About a group's charter, milestones or history** (any chartered group, active
+  or concluded, gathered or not): `get_group_info(acronym)`; `search_groups(query)`
+  searches the charters themselves; `list_milestones` and `group_timeline` are
+  the cross-group and per-group dated views. These read a mirror of the
+  Datatracker, not a corpus: they say what a group is *chartered* to do and what
+  it *recorded*, not what it discussed or decided. The charter is the current one
+  only, and a concluded group's is its last. Milestone dates are targets, often
+  stale.
 - **Corpus missing?** How to add one is stated in **This session** above (it
   depends on this server's mode).
 - **Just started a gather? Wait for `done` before reading.** `overview`,
@@ -75,6 +85,8 @@ means, call `find_efforts(topic)`; ask only if that doesn't resolve it.
 ## The tools (each tool's own description carries the detail)
 
 - **Orient:** `overview`, `list_corpora`, `find_efforts`, `which_corpus`.
+- **Chartered groups:** `get_group_info`, `search_groups`, `list_milestones`,
+  `group_timeline` — charters, milestones and lifecycle for every WG and RG.
 - **Search:** `search_corpus` (one corpus), `search_corpora` (several),
   `read_topic` (chronological narrative), `find_related` (by example),
   `grep_corpus` (exact string / regex).

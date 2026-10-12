@@ -10,6 +10,7 @@ stages in order (charter → sources → digests → embed), populating
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import shutil
 import sys
@@ -81,6 +82,23 @@ GLOBAL_SCALARS = (
     ("summarize_model", "IETF_LLM_SUMMARIZE_MODEL", None),
 )
 _GLOBAL_KEYS = tuple(name for name, _env, _default in GLOBAL_SCALARS)
+
+
+def embed_settings(
+    args: Optional[argparse.Namespace] = None,
+) -> "tuple[Optional[str], bool]":
+    """`(embedding model, whether to embed)` resolved the way a gather does
+    (env > CLI > global config > default), for work that builds an index
+    outside any one gather. `args` carries the CLI's values, if any."""
+    # A gather resolves `args` in place (and marks it); do not merge twice.
+    if args is not None and getattr(args, "_global_sources", None) is not None:
+        return args.embed_model, not args.no_embed
+    resolved = copy.copy(args) if args is not None else argparse.Namespace()
+    for name, _env, _default in GLOBAL_SCALARS:
+        if not hasattr(resolved, name):
+            setattr(resolved, name, None)
+    config.merge_global(resolved, GLOBAL_SCALARS)
+    return resolved.embed_model, not resolved.no_embed
 
 
 def _default_llm_model(verbose: Verbosity) -> str:

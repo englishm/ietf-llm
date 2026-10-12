@@ -59,7 +59,7 @@ The MCP endpoint is served at `/mcp`; `GET /health` is the readiness probe.
 - **Install torch-free.** `pipx install ietf-llm` is torch-free by design: the server embeds against
   a remote endpoint, not an on-device model. For the cloud store backend add the `s3` extra:
   `pipx install 'ietf-llm[s3]'`.
-- **Provide a remote embeddings endpoint.** Two read tools (`search_corpus`, `read_topic`) embed
+- **Provide a remote embeddings endpoint.** Three read tools (`search_corpus`, `read_topic`, `search_groups`) embed
   their query against `IETF_LLM_EMBED_BASE_URL`; everything else is deterministic. See
   [Model backends](models.md#embeddings).
 - **Decide on storage.** A single replica reads a local or mounted cache; a fleet uses the cloud
@@ -72,7 +72,7 @@ The MCP endpoint is served at `/mcp`; `GET /health` is the readiness probe.
   `search_rfc_index`, `search_rfc_text`, `get_rfc_info` and `get_rfc_section`
   cover the whole published series and belong to no corpus, so gathering
   corpora does not bring them. Their data — the metadata mirror, the effort
-  catalog, and ~285 MB of RFC full text from the seed store — normally arrives
+  catalog, the chartered-group mirror (charters, milestones, timeline), and ~285 MB of RFC full text from the seed store — normally arrives
   as gather housekeeping; a deployment that gathers nothing never reaches it.
   `--init` does that housekeeping and exits, writing into the same
   `IETF_LLM_CACHE_DIR` the server reads. It needs a **writable** cache: on a
@@ -242,10 +242,13 @@ The **cloud store backend** (`IETF_LLM_STORE_BACKEND=cloud`, see
 with no separate sync and no torn read. It is also what makes the [in-session
 gather](#in-session-gather) durable and fleet-coherent rather than a single-box convenience.
 
-**Degraded mode when the embedding upstream is down.** Only two tools embed their query, and they are
+**Degraded mode when the embedding upstream is down.** Only three tools embed their query, and they are
 the only ones that fail if the remote `/v1/embeddings` endpoint is unreachable:
 
-- **Fail:** `search_corpus` and `read_topic`.
+- **Fail:** `search_corpus`, `read_topic` and `search_groups`.
+- **Degrade:** `find_efforts` also embeds its query (to search charters) but falls back to its keyword
+  ranking alone, and `search_groups` itself falls back to keyword matching when the *charter index* is
+  missing (though not when the embedding backend errors).
 - **Keep working:** every deterministic tool — `overview`, `read_digest`, `list_corpora`,
   `list_files`, `list_labels`, `grep_corpus`, `find_citations`, `find_replies`, `tally_positions`,
   `search_rfc_index` / `get_rfc_info`, `read_file_section`, `get_chunk_text` / `get_chunks_batch`, and

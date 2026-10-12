@@ -636,6 +636,36 @@ def _chunk_thread_file(text: str, filename: str) -> List[Chunk]:
     return chunks
 
 
+_CHARTER_TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
+_CHARTER_STATE_RE = re.compile(r"^State:\s*(\S+)", re.MULTILINE)
+_CHARTER_AREA_RE = re.compile(r"^Area:.*\((\S+)\)\s*$", re.MULTILINE)
+_CHARTER_TYPE_RE = re.compile(r"^Type:\s*(Working|Research) Group", re.MULTILINE)
+
+
+def _chunk_charter_file(text: str, filename: str) -> List[Chunk]:
+    """A rendered `_groups` charter: windowed like any text, but every window
+    carries the group's state, area and type so a search can be scoped to
+    them (`state=`, `label="area:wit"`) and shows who it came from."""
+    chunks = _chunk_windowed(text, filename)
+    title = _CHARTER_TITLE_RE.search(text)
+    state = _CHARTER_STATE_RE.search(text)
+    area = _CHARTER_AREA_RE.search(text)
+    kind = _CHARTER_TYPE_RE.search(text)
+    source = _CHARTER_SOURCE_RE.search(text)
+    labels = []
+    if area:
+        labels.append(f"area:{area.group(1).lower()}")
+    if kind:
+        labels.append("type:wg" if kind.group(1) == "Working" else "type:rg")
+    for chunk in chunks:
+        if title:
+            chunk.title = title.group(1)[:80]
+        chunk.state = state.group(1).lower() if state else None
+        chunk.labels = ",".join(labels) or None
+        chunk.url = source.group(1) if source else None
+    return chunks
+
+
 def _chunk_file(path: str, relpath: str) -> List[Chunk]:
     """Read a cache file and dispatch to the right chunker based on its
     location in the cache layout.
@@ -656,6 +686,10 @@ def _chunk_file(path: str, relpath: str) -> List[Chunk]:
     # files do too, but never reach here — `_eligible_files` skips them.)
     if lower.startswith("issues/") and lower.endswith(".md"):
         return _chunk_thread_file(text, relpath)
+    # Charters in the cross-corpus `_groups` mirror (not a gathered corpus's
+    # own `charter.txt`, which stays an ordinary windowed file).
+    if lower.startswith("charters/") and lower.endswith(".md"):
+        return _chunk_charter_file(text, relpath)
     return _chunk_windowed(text, relpath)
 
 
@@ -681,6 +715,7 @@ def _eligible_files(cache_dir: str, wg: str) -> List[str]:
         + `get_issue`, neither of which touches the index. Reversing this
         means dropping the skip AND restoring the `pulls/` branches in
         `_chunk_file` / `_chunk_thread_file` and in `mcp/topic.py`.
+      - `state/` (the `_groups` mirror's writer-side bookkeeping)
       - `meetings/<code>/slides/*.pdf` (binaries — we index the
         sibling `.pdf.txt` extracts instead)
       - `drafts/draft-…-NN.txt` revisions of a draft whose Datatracker
@@ -706,6 +741,8 @@ def _eligible_files(cache_dir: str, wg: str) -> List[str]:
             if relpath_lower.startswith("raw/"):
                 continue
             if relpath_lower.startswith("pulls/"):
+                continue
+            if relpath_lower.startswith("state/"):
                 continue
             if name.endswith(".pdf") or name.endswith(".json"):
                 continue

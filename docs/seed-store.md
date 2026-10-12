@@ -302,6 +302,27 @@ cached `_seed/index.json` and revalidates in the background (bounded + throttled
 routine `list_corpora` never stalls. The read-only HTTP replica never fetches and
 omits the section (you can't gather there anyway).
 
+## The chartered-group mirror (`_groups`)
+
+`_groups` is a member of the **main** store, unlike `rfcs`: its charters are
+chunked and embedded by our own pipeline, so it carries the same compatibility
+tuple as any gathered corpus and has no reason to live apart. Two things set it
+apart from an ordinary member:
+
+- **It has no gather command.** The publisher refreshes it in-process with the
+  same writer the housekeeping step runs (`gather.sources.groups`), without the
+  per-run charter cap, so a snapshot holds every charter. `--add _groups` makes it
+  a member like any other; `--no-gather` publishes what is already in the cache.
+- **The client installs it only on a cold start.** A machine with no mirror
+  installs the snapshot; one that has a mirror refreshes it incrementally from the
+  Datatracker, which is cheaper than another download. The bundle includes
+  `files/state/` (the per-feed watermarks and raw rows) precisely so that first
+  refresh is a delta.
+
+The bundle is the whole `_groups` tree plus its `embeddings.db`. Names starting
+with `_` are machinery, so `list_corpora` does not offer `_groups` as a corpus to
+fast-start. See [architecture.md](architecture.md#the-chartered-group-mirror).
+
 ## Externally-sourced members
 
 Most members are gathered and then bundled. A member may instead be

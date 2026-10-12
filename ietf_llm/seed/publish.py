@@ -80,9 +80,43 @@ class PublishReport:
     skipped: List[Tuple[str, str]] = field(default_factory=list)  # name, reason
 
 
+def _refresh_groups() -> None:
+    """Bring the chartered-group mirror fully up to date, charters and index
+    included. It has no gather of its own to shell out to; this runs the same
+    writer the housekeeping step runs, without the per-run charter cap, so a
+    published snapshot is complete and no client has to trickle it in."""
+    # Lazy: the gather path stays off the seed module's import.
+    # pylint: disable=import-outside-toplevel
+    from ..gather.sequencer import embed_settings
+    from ..gather.sources.groups import ensure_groups_index
+    from ..log import Verbosity
+    from ..singletons import groups as group_mirror
+
+    # pylint: enable=import-outside-toplevel
+    model, embed = embed_settings()
+    ensure_groups_index(
+        Verbosity.STATUS,
+        force=True,
+        embed_model=model,
+        embed=embed,
+        batch=sys.maxsize,
+        seed=False,
+    )
+    if not os.path.isfile(
+        os.path.join(group_mirror.groups_files_dir(), group_mirror.GROUPS_FILE)
+    ):
+        raise PublishError("refresh of the chartered-group mirror failed")
+
+
 def _default_gather(corpus: str, months: int) -> None:
     """Run an incremental gather of `corpus` via the normal CLI, so the publisher
     is not a second cache writer. Raises `PublishError` on a non-zero exit."""
+    # pylint: disable-next=import-outside-toplevel
+    from ..singletons.groups import GROUPS_CORPUS
+
+    if corpus == GROUPS_CORPUS:
+        _refresh_groups()
+        return
     cmd = [sys.executable, "-m", "ietf_llm", corpus, "--months", str(months)]
     result = subprocess.run(cmd, check=False)  # nosec B603 — fixed argv, our CLI
     if result.returncode != 0:

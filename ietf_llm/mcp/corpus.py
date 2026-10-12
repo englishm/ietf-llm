@@ -8,7 +8,6 @@ import os
 from typing import TYPE_CHECKING, List, Optional
 
 from .. import coverage
-from ..singletons.catalog import render_efforts
 from ..corpus import describe, kind_status, status_cell
 from ..digest.overview import (
     _label_frequencies,
@@ -20,6 +19,7 @@ from ..freshness import gather_enabled, gather_suggestion, seed_source
 from ..gather.sources.github import label_descriptions
 from ..paths import digest_kind_from_relpath, github_dir
 from ..corpus.routing import DEFAULT_MIN_SCORE, route
+from .groups import tool_find_efforts
 from .common import (
     _DIGEST_KINDS,
     _deployment_phrase,
@@ -96,7 +96,13 @@ def _available_to_seed(local: List[str]) -> str:
     if index is None:
         return ""
     known = set(local)
-    names = sorted(e.name for e in index.corpora if e.name not in known)
+    # Underscore-prefixed members (the chartered-group mirror) are machinery
+    # that installs itself, not corpora to gather.
+    names = sorted(
+        e.name
+        for e in index.corpora
+        if e.name not in known and not e.name.startswith("_")
+    )
     if not names:
         return ""
     return (
@@ -519,7 +525,7 @@ def register(server: "FastMCP") -> None:
 
     @server.tool()
     async def find_efforts(query: str, limit: int = 15) -> str:
-        """Find active IETF/IRTF efforts by **topic** — the entry point
+        """Find IETF/IRTF efforts by **topic** — the entry point
         for "what is the IETF doing around X?" when no working group is
         named. Returns a ranked markdown list of working/research groups,
         each tagged with whether it is **already gathered here** (`✓
@@ -534,10 +540,13 @@ def register(server: "FastMCP") -> None:
         home — "AI", "post-quantum", "congestion control", "email
         security" — instead of guessing a corpus or crawling Datatracker /
         the web. It ranks over the official Datatracker group list
-        (acronym + name + charter description), mirrored locally; it covers
-        **active** and **BoF** groups only, so a concluded effort or
-        published work won't surface here — use `search_rfc_index` for the RFC
-        series, and `list_corpora` to see what is already cached.
+        (acronym, name and description) blended with a semantic search of
+        each group's **charter**, mirrored locally. It covers active groups,
+        BoFs and **concluded** groups; a concluded group is labelled and
+        ranks below an active one that matches equally well. Published work
+        won't surface here — use `search_rfc_index` for the RFC series, and
+        `list_corpora` to see what is already cached. To search the charters
+        themselves, or filter by area or state, use `search_groups`.
 
         The playbook: `find_efforts(topic)` → present the candidates
         (prefer the cached ones) → gather the **few** efforts that
@@ -548,7 +557,7 @@ def register(server: "FastMCP") -> None:
 
         `limit` caps results (default 15).
         """
-        return await _offload(render_efforts, query, limit)
+        return await _offload(tool_find_efforts, query, limit)
 
     @server.tool()
     async def which_corpus(query: str, limit: int = 8) -> str:
