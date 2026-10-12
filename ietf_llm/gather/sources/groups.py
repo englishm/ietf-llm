@@ -527,7 +527,7 @@ def _is_pending(have: Dict[str, Any], now: float) -> bool:
     """
     if have.get("ok"):
         return False
-    age = now - have.get("at", 0)
+    age = float(now - have.get("at", 0))
     if have.get("absent") or "tries" not in have:
         return age >= _RETRY_AFTER
     if have["tries"] >= _MAX_TRIES:
