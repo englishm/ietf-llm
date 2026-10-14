@@ -49,7 +49,10 @@ dependencies = [
 # this, the local `sentence-transformers/...` default model is unavailable
 # and the embedding backend must be a remote `openai-embed/...` endpoint.
 # Kept out of base so the serving/ingest image stays torch-free.
-local-embeddings = ["llm-sentence-transformers"]
+# `torch` is listed directly so that where no wheel exists (Intel Macs on
+# Python 3.13+) pip fails at once, instead of backtracking through every
+# sentence-transformers / tqdm release until "resolution-too-deep" (issue #254).
+local-embeddings = ["llm-sentence-transformers", "torch"]
 # NotebookLM Enterprise export: Google auth libraries. Only the
 # `ietf-llm-export` NotebookLM push needs these; mirror mode does not.
 notebooklm = [
