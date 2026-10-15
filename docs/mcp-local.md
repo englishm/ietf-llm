@@ -25,7 +25,8 @@ To serve many clients from one shared process instead, see
 pipx install 'ietf-llm[local-embeddings]'
 ```
 
-The `[local-embeddings]` option installs an embedding backend for search (necessary for a local server).
+The `[local-embeddings]` option installs an embedding backend for search (necessary for a local server). On an Intel Mac this needs Python 3.10–3.12; see
+[models](models.md#on-device-default).
 
 **Behind a corporate firewall** with TLS interception? Nothing extra to install — we verify
 against your OS trust store, so a root your machine already trusts just works. If the proxy's

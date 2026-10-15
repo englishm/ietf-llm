@@ -39,6 +39,11 @@ no API key. It requires installing the `local-embeddings` extra (torch is not in
 pipx install 'ietf-llm[local-embeddings]'
 ```
 
+**Intel Macs** need Python 3.10–3.12: PyTorch publishes no Intel-Mac wheels for 3.13 or later, so
+the install fails with "No matching distribution found for torch". Install under an older Python
+(`pipx install --python python3.12 'ietf-llm[local-embeddings]'`), or omit the extra and use a
+remote endpoint (below).
+
 The weights download from Hugging Face on first use and are cached; subsequent gathers reuse them.
 
 **Device.** Embedding runs on **CPU by default**. MPS (the Apple Silicon GPU) is deliberately
