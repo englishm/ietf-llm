@@ -274,6 +274,9 @@ def test_download_github_issues_owner_starting_with_http(
     monkeypatch.setattr(  # type: ignore[attr-defined]
         github, "_fetch_all_issues", lambda *a, **k: [],
     )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        github, "_fetch_all_pulls", lambda *a, **k: [],
+    )
     dest = tmp_path / "drafts.json"
     ok = github.download_github_issues(
         "httpwg/drafts", str(dest), verbose=Verbosity.QUIET,

@@ -332,6 +332,7 @@ def download_github_issues(
             "repo": f"{owner}/{repo}",
             "timestamp": datetime.now().isoformat(),
             "issues": all_issues,
+            "pulls": _fetch_all_pulls(owner, repo, headers),
         }
         with atomic_open(dest_path) as json_fh:
             json.dump(export_data, json_fh, indent=2)
@@ -532,3 +533,95 @@ def _fetch_issue_comments(
             break
         page += 1
     return out
+
+
+def _get_all(url: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Every item of a paged GitHub list endpoint (100 per page). A non-200
+    page ends the list, as for issue comments."""
+    out: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        res = governed_get(
+            url, headers=headers, params={"per_page": 100, "page": page}, timeout=30
+        )
+        if res.status_code != 200:
+            break
+        items = res.json()
+        if not items:
+            break
+        out.extend(items)
+        if len(items) < 100:
+            break
+        page += 1
+    return out
+
+
+def _login(user: Optional[Dict[str, Any]]) -> Optional[str]:
+    return (user or {}).get("login")
+
+
+def _fetch_all_pulls(
+    owner: str, repo_name: str, headers: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """Fetch every pull request with its conversation, reviews and review
+    comments, in the shape the gh-pages archive.json uses, so a repo without
+    one (a fork, say, where design work is staged in PRs) still yields PRs."""
+    base = f"https://api.github.com/repos/{owner}/{repo_name}"
+    pulls: List[Dict[str, Any]] = []
+    for pr in _get_all(f"{base}/pulls?state=all", headers):
+        number = pr.get("number")
+        merged_at = pr.get("merged_at")
+        merged_by = None
+        if merged_at:
+            # The list endpoint omits merged_by; the single-PR one has it.
+            detail = governed_get(f"{base}/pulls/{number}", headers=headers, timeout=30)
+            if detail.status_code == 200:
+                merged_by = _login(detail.json().get("merged_by"))
+        review_comments: Dict[Any, List[Dict[str, Any]]] = {}
+        for rc in _get_all(f"{base}/pulls/{number}/comments", headers):
+            review_comments.setdefault(rc.get("pull_request_review_id"), []).append(
+                {
+                    "path": rc.get("path"),
+                    "originalPosition": rc.get("original_position"),
+                    "body": rc.get("body"),
+                    "createdAt": rc.get("created_at"),
+                    "updatedAt": rc.get("updated_at"),
+                }
+            )
+        reviews = [
+            {
+                "id": review.get("id"),
+                "author": _login(review.get("user")),
+                "state": review.get("state"),
+                "body": review.get("body") or "",
+                "createdAt": review.get("submitted_at"),
+                "comments": review_comments.get(review.get("id"), []),
+            }
+            for review in _get_all(f"{base}/pulls/{number}/reviews", headers)
+        ]
+        pulls.append(
+            {
+                "number": number,
+                "title": pr.get("title"),
+                "state": "MERGED" if merged_at else (pr.get("state") or "").upper(),
+                "author": _login(pr.get("user")),
+                "body": pr.get("body"),
+                "createdAt": pr.get("created_at"),
+                "updatedAt": pr.get("updated_at"),
+                "closedAt": pr.get("closed_at"),
+                "mergedAt": merged_at,
+                "mergedBy": merged_by,
+                "mergeCommit": (
+                    {"oid": pr.get("merge_commit_sha")} if merged_at else None
+                ),
+                "labels": [lbl.get("name") for lbl in pr.get("labels") or []],
+                "url": pr.get("html_url"),
+                "headRefName": (pr.get("head") or {}).get("ref"),
+                "baseRefName": (pr.get("base") or {}).get("ref"),
+                "comments": _fetch_issue_comments(
+                    f"{base}/issues/{number}/comments", headers
+                ),
+                "reviews": reviews,
+            }
+        )
+    return pulls
