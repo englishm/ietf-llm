@@ -226,10 +226,10 @@ def tool_read_topic(  # pylint: disable=too-many-arguments,too-many-positional-a
     # are the only chunks that represent a "message" in a debate.
     # Windowed draft / transcript chunks may match a query but they
     # aren't messages, so the chronological view skips them.
-    # (Per-PR files have the same shape but are never indexed — see the
-    # `pulls/` skip in `embeddings.chunking._eligible_files`.)
+    # Per-PR files have the same shape; they are in the index only for
+    # corpora opted in via `embeddings.chunking.index_pulls`.
     thread_issue_hits = [
-        h for h in hits if h.file.lower().startswith(("threads/", "issues/"))
+        h for h in hits if h.file.lower().startswith(("threads/", "issues/", "pulls/"))
     ]
     matched = thread_issue_hits[:k]
     # For the completeness signal: how many more matched than we show, and

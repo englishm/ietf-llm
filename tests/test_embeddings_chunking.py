@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from ietf_llm.embeddings import (
     EMBED_CHAR_BUDGET,
     EMBED_CHAR_OVERLAP,
@@ -282,6 +284,64 @@ def test_eligible_files_excludes_pulls_but_not_issues(
     eligible = _eligible_files(str(files_dir), "wg")
     relpaths = sorted(os.path.relpath(p, str(files_dir)) for p in eligible)
     assert relpaths == ["issues/org-repo/1.md"]
+
+
+def test_eligible_files_includes_pulls_when_opted_in(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # IETF_LLM_INDEX_PULLS opts named corpora (or "all") into indexing PRs.
+    files_dir = isolated_home / ".cache" / "ietf-llm" / "wg" / "files"
+    (files_dir / "pulls" / "org-repo").mkdir(parents=True)
+    (files_dir / "pulls" / "org-repo" / "2.md").write_text("# Pull request #2\n")
+    for value, expected in [
+        ("other", []),
+        ("other, WG", ["pulls/org-repo/2.md"]),
+        ("all", ["pulls/org-repo/2.md"]),
+    ]:
+        monkeypatch.setenv("IETF_LLM_INDEX_PULLS", value)
+        eligible = _eligible_files(str(files_dir), "wg")
+        assert [os.path.relpath(p, str(files_dir)) for p in eligible] == expected
+
+
+_PULL_FILE = """# Pull request #7: Rename the frame
+
+**Repository:** org/repo  
+**URL:** https://github.com/org/repo/pull/7  
+**State:** CLOSED  
+**Labels:** Design  
+**Disposition:** merged by Bob on 2026-01-03 00:00
+
+**Closing note:**
+
+Merged after the interim.
+
+## Outline
+
+- **[1]** 2026-01-01 00:00 — Alice _(opened pull request)_
+
+### [1] 2026-01-01 00:00 — Alice
+
+Body of the PR.
+
+### [2] 2026-01-02 00:00 — Carol _(review: changes requested)_
+
+This breaks the control stream.
+"""
+
+
+def test_pull_file_chunks_like_an_issue(tmp_path: Path) -> None:
+    path = tmp_path / "7.md"
+    path.write_text(_PULL_FILE)
+    chunks = _chunk_file(str(path), "pulls/org-repo/7.md")
+    # The header, then one chunk per message, all stamped like an issue's.
+    assert [c.title for c in chunks][0] == "(thread header)"
+    assert len(chunks) == 3
+    for chunk in chunks:
+        assert chunk.url == "https://github.com/org/repo/pull/7"
+        assert chunk.state == "closed"
+        assert chunk.labels == "design"
+        assert chunk.closing_rationale == "Merged after the interim."
+    assert "control stream" in chunks[2].text
 
 
 def test_eligible_files_skips_rfc_and_replaced_draft_revisions(

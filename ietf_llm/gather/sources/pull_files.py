@@ -24,16 +24,15 @@ every reader in the tree already speaks: `tally_positions` parses those
 section headers, the citation scanners walk the bodies, and a human reading
 one file after the other shouldn't have to re-learn the layout.
 
-**These files are not embedded.** `embeddings.chunking._eligible_files` skips
-`pulls/` — the measured cost is +31% chunks on httpbis for record the
+**These files are not embedded by default.** `embeddings.chunking._eligible_files`
+skips `pulls/` — the measured cost is +31% chunks on httpbis for record the
 catalogue already carries, and the reasons to have PRs at all (the blame walk,
 and the argument in a PR body) are served by `digests/pulls.md`, `get_issue`
-and `grep_corpus`, none of which touch the index. One consequence shows up
-here: the `**Closing note:**` block deliberately does NOT use the issue files'
-`**Closing rationale:**` wording, and nothing stamps it as file-level chunk
-metadata the way `_extract_issue_rationale` does for issues, because there are
-no chunks to stamp. If PRs are ever indexed, that extractor needs teaching
-about this heading.
+and `grep_corpus`, none of which touch the index. `IETF_LLM_INDEX_PULLS` opts
+corpora in, for groups whose design is argued in PR review. The
+`**Closing note:**` block deliberately does NOT use the issue files'
+`**Closing rationale:**` wording; `_extract_issue_rationale` accepts both, so
+an indexed PR's chunks carry it the same way an issue's do.
 
 Two places where the PR shape forces a different decision from issues:
 

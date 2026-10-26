@@ -226,7 +226,7 @@ _ISSUE_DUP_RE = re.compile(r"^\*\*Duplicate of:\*\*\s*#?(\d+)", re.MULTILINE)
 # We capture everything up to the next blank line + ## section, since
 # the rationale is one block of markdown.
 _ISSUE_RATIONALE_RE = re.compile(
-    r"^\*\*Closing rationale:\*\*\s*\n+(.+?)(?=\n\n##|\Z)",
+    r"^\*\*Closing (?:rationale|note):\*\*\s*\n+(.+?)(?=\n\n##|\Z)",
     re.MULTILINE | re.DOTALL,
 )
 
@@ -563,9 +563,9 @@ def _chunk_thread_file(text: str, filename: str) -> List[Chunk]:
     # chunk lets search-time filters (label="top-level", state="closed")
     # shortlist by curation + resolution before semantic ranking.
     # Post-reorg, issue files live under `issues/<repo>/<N>.md`. Per-PR
-    # files share this format but are not indexed at all — see the
-    # `pulls/` skip in `_eligible_files` for why.
-    is_issue = filename.lower().startswith("issues/")
+    # files (`pulls/<repo>/<N>.md`) share this format; they are indexed
+    # only for corpora opted in via `index_pulls` (see `_eligible_files`).
+    is_issue = filename.lower().startswith(("issues/", "pulls/"))
     labels = _extract_issue_labels(text) if is_issue else None
     state = _extract_issue_state(text) if is_issue else None
     # Citation URL: for issue files the URL is file-level (every chunk
@@ -682,15 +682,29 @@ def _chunk_file(path: str, relpath: str) -> List[Chunk]:
     # Per-thread reconstructions are the LLM-legible mailing-list form.
     if lower.startswith("threads/") and lower.endswith(".md"):
         return _chunk_thread_file(text, relpath)
-    # Per-issue reconstructions share the thread file format. (Per-PR
-    # files do too, but never reach here — `_eligible_files` skips them.)
-    if lower.startswith("issues/") and lower.endswith(".md"):
+    # Per-issue and per-PR reconstructions share the thread file format.
+    # (Per-PR files reach here only for corpora opted in via `index_pulls`.)
+    if lower.startswith(("issues/", "pulls/")) and lower.endswith(".md"):
         return _chunk_thread_file(text, relpath)
     # Charters in the cross-corpus `_groups` mirror (not a gathered corpus's
     # own `charter.txt`, which stays an ordinary windowed file).
     if lower.startswith("charters/") and lower.endswith(".md"):
         return _chunk_charter_file(text, relpath)
     return _chunk_windowed(text, relpath)
+
+
+def index_pulls(wg: str) -> bool:
+    """Whether per-PR files are embedded for corpus `wg`.
+
+    Off by default (see the `pulls/` skip in `_eligible_files`).
+    `IETF_LLM_INDEX_PULLS` turns it on: a comma- or space-separated list
+    of corpora, or `all`. Changing it takes effect on the next index
+    build: newly eligible PR files are embedded, and dropping a corpus
+    prunes its PR chunks.
+    """
+    raw = os.environ.get("IETF_LLM_INDEX_PULLS", "")
+    names = {n.lower() for n in re.split(r"[\s,]+", raw) if n}
+    return "all" in names or wg.lower() in names
 
 
 def _eligible_files(cache_dir: str, wg: str) -> List[str]:
@@ -715,6 +729,9 @@ def _eligible_files(cache_dir: str, wg: str) -> List[str]:
         + `get_issue`, neither of which touches the index. Reversing this
         means dropping the skip AND restoring the `pulls/` branches in
         `_chunk_file` / `_chunk_thread_file` and in `mcp/topic.py`.
+        For a group whose design is argued in PR review, the trade-off
+        runs the other way: `IETF_LLM_INDEX_PULLS` opts corpora in (see
+        `index_pulls`).
       - `state/` (the `_groups` mirror's writer-side bookkeeping)
       - `meetings/<code>/slides/*.pdf` (binaries — we index the
         sibling `.pdf.txt` extracts instead)
@@ -726,6 +743,7 @@ def _eligible_files(cache_dir: str, wg: str) -> List[str]:
         `.txt` files and active / expired drafts are unaffected.
     """
     skip_drafts = skip_embed_draft_names(wg)
+    with_pulls = index_pulls(wg)
     out = []
     for dirpath, _dirnames, filenames in os.walk(cache_dir):
         for name in sorted(filenames):
@@ -740,7 +758,7 @@ def _eligible_files(cache_dir: str, wg: str) -> List[str]:
                 continue
             if relpath_lower.startswith("raw/"):
                 continue
-            if relpath_lower.startswith("pulls/"):
+            if relpath_lower.startswith("pulls/") and not with_pulls:
                 continue
             if relpath_lower.startswith("state/"):
                 continue
