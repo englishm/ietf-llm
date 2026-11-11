@@ -94,6 +94,15 @@ def build_parser() -> argparse.ArgumentParser:
         "(repeat for multiple).",
     )
     parser.add_argument(
+        "--repo-docs",
+        action="append",
+        metavar="OWNER/REPO/PATH",
+        dest="repo_docs",
+        help="Markdown files in a GitHub repo to gather (meeting notes, "
+        "proposals): every .md at or under PATH on the default branch, or "
+        "the whole repo for OWNER/REPO (repeat for multiple). Persisted.",
+    )
+    parser.add_argument(
         "--draft",
         action="append",
         metavar="DRAFT-NAME",

@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from ..gather.sources.documents_manifest import skip_embed_draft_names
 from ..gather.sources.drafts import normalize_draft_name
+from ..gather.sources.repo_docs import source_url as repo_doc_url
 
 # Character budget per embedded chunk. The embedding model only embeds the
 # first ~512 tokens of whatever text it's given; anything past that is silently
@@ -328,6 +329,8 @@ def _windowed_citation_url(relpath: str, text: str) -> Optional[str]:
         if name.startswith("draft-"):
             return f"https://datatracker.ietf.org/doc/{name}/"
         return None
+    if lower.startswith("docs/"):
+        return repo_doc_url(relpath)
     if lower == "charter.txt" or lower.endswith("/charter.txt"):
         match = _CHARTER_SOURCE_RE.search(text)
         if match:

@@ -41,6 +41,8 @@ def _gather_plan_summary(args: argparse.Namespace) -> str:
         parts.append(f"lists: {_brief(args.mailing_list)}")
     if args.github:
         parts.append(f"github: {_brief(args.github)}")
+    if getattr(args, "repo_docs", None):
+        parts.append(f"repo docs: {_brief(args.repo_docs)}")
     if args.add_mentioned_drafts:
         parts.append("add-mentioned-drafts")
     if args.include_related_drafts:
