@@ -219,6 +219,7 @@ class GatherSpec:
     github: List[str] = field(default_factory=list)
     github_label: List[str] = field(default_factory=list)
     exclude_github_label: List[str] = field(default_factory=list)
+    repo_docs: List[str] = field(default_factory=list)
     author: Optional[str] = None
     new_drafts: bool = False
     months: Optional[int] = None
@@ -240,6 +241,7 @@ class GatherSpec:
             or self.github
             or self.github_label
             or self.exclude_github_label
+            or self.repo_docs
             or self.author
             or self.new_drafts
             or self.add_mentioned_drafts
@@ -259,6 +261,8 @@ class GatherSpec:
             argv += ["--github-label", value]
         for value in self.exclude_github_label:
             argv += ["--exclude-github-label", value]
+        for value in self.repo_docs:
+            argv += ["--repo-docs", value]
         if self.author:
             argv += ["--author", self.author]
         if self.new_drafts:
@@ -289,6 +293,7 @@ class GatherSpec:
             "github",
             "github_label",
             "exclude_github_label",
+            "repo_docs",
         ):
             value = getattr(self, key)
             if value:

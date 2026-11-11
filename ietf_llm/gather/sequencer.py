@@ -65,6 +65,7 @@ from .sources.pdf_extract import extract_all_pdfs
 from .sources.pull_files import write_pull_files
 from .sources.recent_drafts import fetch_new_draft_names, prune_drafts
 from .sources.repo_discovery import autotrack_github
+from .sources.repo_docs import gather_repo_docs
 from .sources.transcript_context import enrich_transcripts
 from .sources.transcripts import process_transcripts
 from .stages import ProgressFn, StageTracker, stage_plan
@@ -159,9 +160,11 @@ def _resolve_corpus_shape(
         args.mailing_list
         or args.draft
         or args.github
+        or getattr(args, "repo_docs", None)
         or persisted.get("mailing_list")
         or persisted.get("draft")
         or persisted.get("github")
+        or persisted.get("repo_docs")
     )
     if not has_sources:
         if validate_list_names([args.wg], verbosity):
@@ -604,6 +607,7 @@ def _gather_one(  # pylint: disable=too-many-branches,too-many-statements
             "exclude_github_label",
             "draft",
             "mailing_list",
+            "repo_docs",
         ),
         defaults={
             "months": DEFAULT_MONTHS,
@@ -636,7 +640,7 @@ def _gather_one(  # pylint: disable=too-many-branches,too-many-statements
 
     # `synth` (x-) and `group_backed` were resolved above. A corpus
     # that's neither is "custom" (list/draft/github sources only).
-    if synth and not (args.draft or args.mailing_list or args.github):
+    if synth and not (args.draft or args.mailing_list or args.github or args.repo_docs):
         log(
             f"{args.wg}: synthetic (`x-`) corpus with no --draft / "
             "--mailing-list / --github configured. Gather will produce "
@@ -741,6 +745,11 @@ def _gather_one(  # pylint: disable=too-many-branches,too-many-statements
         process_extra_drafts(args.draft, cache_dir, verbose=verbosity)
 
     _gather_dynamic_drafts(args, cache_dir, persisted, verbosity)
+
+    # Markdown notes and proposals kept as files in GitHub repos.
+    if args.repo_docs:
+        tracker.begin("repo docs")
+    gather_repo_docs(args.repo_docs, cache_dir, verbose=verbosity)
 
     # Extract text from any PDFs in the cache (slide decks, whiteboards,
     # etc.). Writes a sibling .pdf.txt for each so the chunker picks

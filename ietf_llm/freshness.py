@@ -547,6 +547,7 @@ _SOURCE_CHANGE_FLAGS = (
     "github",
     "github_label",
     "exclude_github_label",
+    "repo_docs",
     "author",
     "new_drafts",
     "add_mentioned_drafts",
