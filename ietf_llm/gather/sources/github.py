@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import time
 from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -326,13 +327,16 @@ def download_github_issues(
     if github_token:
         headers["Authorization"] = f"token {github_token}"
 
+    previous = _load_previous(dest_path)
     try:
-        all_issues = _fetch_all_issues(owner, repo, headers, verbose)
+        all_issues = _fetch_all_issues(
+            owner, repo, headers, verbose, previous.get("issues")
+        )
         export_data = {
             "repo": f"{owner}/{repo}",
             "timestamp": datetime.now().isoformat(),
             "issues": all_issues,
-            "pulls": _fetch_all_pulls(owner, repo, headers),
+            "pulls": _fetch_all_pulls(owner, repo, headers, previous.get("pulls")),
         }
         with atomic_open(dest_path) as json_fh:
             json.dump(export_data, json_fh, indent=2)
@@ -453,10 +457,84 @@ def _prune_github_orphans(
         )
 
 
+#: Longest wait for a GitHub rate-limit reset (the window is an hour).
+_MAX_RATE_WAIT = 3700
+
+
+class GitHubFetchError(requests.RequestException):
+    """A GitHub API page failed after any rate-limit wait. Raised rather than
+    ending the list early, so a repo is never archived with its discussion
+    silently cut short: the download fails and the previous archive stays."""
+
+
+def _gh_get(url: str, headers: Dict[str, str], **kwargs: Any) -> requests.Response:
+    """GET a GitHub API URL; when the rate limit is spent (403/429 with no
+    requests remaining, or a Retry-After), sleep until it resets and retry."""
+    for _ in range(3):
+        res = governed_get(url, headers=headers, **kwargs)
+        if res.status_code not in (403, 429):
+            return res
+        retry_after = res.headers.get("Retry-After")
+        reset = res.headers.get("X-RateLimit-Reset")
+        if retry_after and retry_after.isdigit():
+            wait = int(retry_after)
+        elif res.headers.get("X-RateLimit-Remaining") == "0" and reset:
+            wait = max(0, int(reset) - int(time.time())) + 5
+        else:
+            return res
+        if wait > _MAX_RATE_WAIT:
+            return res
+        log(
+            f"GitHub rate limit reached; waiting {wait}s for the reset",
+            Verbosity.STATUS,
+            level=LogLevel.STATUS,
+        )
+        time.sleep(wait)
+    return res
+
+
+def _ok_or_end(res: requests.Response, url: str) -> bool:
+    """True for a usable page; False for a 404 or 410, which ends a list.
+    Anything else raises `GitHubFetchError`."""
+    if res.status_code == 200:
+        return True
+    if res.status_code in (404, 410):
+        return False
+    raise GitHubFetchError(f"HTTP {res.status_code} for {url}")
+
+
+def _load_previous(dest_path: str) -> Dict[str, Any]:
+    """The archive an earlier gather wrote at `dest_path`, or {}."""
+    try:
+        with open(dest_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _reusable(previous: Optional[List[Dict[str, Any]]]) -> Dict[Any, Dict[str, Any]]:
+    """Previous entries, by number, that were fetched in full (`complete`) and
+    so can stand in for an unchanged item. Older archives carry no marker:
+    their discussion may have been cut short, so they are fetched again."""
+    return {
+        item.get("number"): item
+        for item in previous or []
+        if isinstance(item, dict) and item.get("complete")
+    }
+
+
 def _fetch_all_issues(
-    owner: str, repo_name: str, headers: Dict[str, str], verbose: Verbosity
+    owner: str,
+    repo_name: str,
+    headers: Dict[str, str],
+    verbose: Verbosity,
+    previous: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch all issues and their comments from GitHub API."""
+    """Fetch all issues and their comments from GitHub API. An issue whose
+    `updatedAt` matches a complete previous entry keeps that entry's comments
+    instead of fetching them again."""
+    reuse = _reusable(previous)
     all_issues = []
     page = 1
     while True:
@@ -464,7 +542,7 @@ def _fetch_all_issues(
             f"https://api.github.com/repos/{owner}/{repo_name}/issues"
             f"?state=all&page={page}&per_page=100"
         )
-        res = governed_get(api_url, headers=headers, timeout=60)
+        res = _gh_get(api_url, headers=headers, timeout=60)
         res.raise_for_status()
         issues = res.json()
         if not issues:
@@ -481,11 +559,16 @@ def _fetch_all_issues(
                 "state": issue.get("state"),
                 "author": issue.get("user", {}).get("login"),
                 "createdAt": issue.get("created_at"),
+                "updatedAt": issue.get("updated_at"),
                 "labels": [l.get("name") for l in issue.get("labels", [])],
                 "body": issue.get("body"),
                 "comments": [],
+                "complete": True,
             }
-            if issue.get("comments", 0) > 0:
+            prior = reuse.get(issue_data["number"])
+            if prior and prior.get("updatedAt") == issue_data["updatedAt"]:
+                issue_data["comments"] = prior.get("comments") or []
+            elif issue.get("comments", 0) > 0:
                 issue_data["comments"] = _fetch_issue_comments(
                     issue.get("comments_url"), headers
                 )
@@ -510,13 +593,13 @@ def _fetch_issue_comments(
     out: List[Dict[str, Any]] = []
     page = 1
     while True:
-        c_res = governed_get(
+        c_res = _gh_get(
             comments_url,
             headers=headers,
             params={"per_page": 100, "page": page},
             timeout=30,
         )
-        if c_res.status_code != 200:
+        if not _ok_or_end(c_res, comments_url):
             break
         comments = c_res.json()
         if not comments:
@@ -536,15 +619,15 @@ def _fetch_issue_comments(
 
 
 def _get_all(url: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
-    """Every item of a paged GitHub list endpoint (100 per page). A non-200
-    page ends the list, as for issue comments."""
+    """Every item of a paged GitHub list endpoint (100 per page). A 404 ends
+    the list; any other failure raises (see `_ok_or_end`)."""
     out: List[Dict[str, Any]] = []
     page = 1
     while True:
-        res = governed_get(
+        res = _gh_get(
             url, headers=headers, params={"per_page": 100, "page": page}, timeout=30
         )
-        if res.status_code != 200:
+        if not _ok_or_end(res, url):
             break
         items = res.json()
         if not items:
@@ -561,21 +644,33 @@ def _login(user: Optional[Dict[str, Any]]) -> Optional[str]:
 
 
 def _fetch_all_pulls(
-    owner: str, repo_name: str, headers: Dict[str, str]
+    owner: str,
+    repo_name: str,
+    headers: Dict[str, str],
+    previous: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch every pull request with its conversation, reviews and review
     comments, in the shape the gh-pages archive.json uses, so a repo without
-    one (a fork, say, where design work is staged in PRs) still yields PRs."""
+    one (a fork, say, where design work is staged in PRs) still yields PRs.
+
+    A PR whose `updatedAt` matches a complete previous entry is reused as is:
+    on a large repo the per-PR calls (about four each) are what exhaust the
+    hourly API budget, and most PRs don't change between gathers."""
     base = f"https://api.github.com/repos/{owner}/{repo_name}"
+    reuse = _reusable(previous)
     pulls: List[Dict[str, Any]] = []
     for pr in _get_all(f"{base}/pulls?state=all", headers):
         number = pr.get("number")
+        prior = reuse.get(number)
+        if prior and prior.get("updatedAt") == pr.get("updated_at"):
+            pulls.append(prior)
+            continue
         merged_at = pr.get("merged_at")
         merged_by = None
         if merged_at:
             # The list endpoint omits merged_by; the single-PR one has it.
-            detail = governed_get(f"{base}/pulls/{number}", headers=headers, timeout=30)
-            if detail.status_code == 200:
+            detail = _gh_get(f"{base}/pulls/{number}", headers=headers, timeout=30)
+            if _ok_or_end(detail, f"{base}/pulls/{number}"):
                 merged_by = _login(detail.json().get("merged_by"))
         review_comments: Dict[Any, List[Dict[str, Any]]] = {}
         for rc in _get_all(f"{base}/pulls/{number}/comments", headers):
@@ -622,6 +717,7 @@ def _fetch_all_pulls(
                     f"{base}/issues/{number}/comments", headers
                 ),
                 "reviews": reviews,
+                "complete": True,
             }
         )
     return pulls
